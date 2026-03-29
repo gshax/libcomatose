@@ -1,0 +1,3 @@
+-pedantic
+-Wall
+-Iinclude
