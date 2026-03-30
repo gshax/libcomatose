@@ -29,11 +29,21 @@ void dua_close(dua_session_t *sess);
 /* get fd for poll/select. */
 int dua_fd(const dua_session_t *sess);
 
+/* get the last DUA-level error code (negative enum dua_error value).
+ * only meaningful after a function returns COMATOSE_ERR_DUA. */
+int32_t dua_last_error(const dua_session_t *sess);
+
 /*
  * initialization
  */
 
-/* send ApplInit (cmd 0x13). must be called before other DUA operations. */
+/* initialize DUA shared memory and send InitReq (cmd 0x01).
+ * this MUST be called on a fresh CSS boot before any other DUA operations.
+ * opens /dev/sharedmem, sends CMSG_SHAREDMEM_INIT to CSS, mmaps shared
+ * memory, then sends DUA_CMD_INIT_REQ with the shared memory pointer. */
+comatose_result_t dua_init_hw(dua_session_t *sess);
+
+/* send ApplInit (cmd 0x13). must be called after dua_init_hw(). */
 comatose_result_t dua_appl_init(dua_session_t *sess);
 
 /*
@@ -99,6 +109,16 @@ comatose_result_t dua_conn_unmerge(dua_session_t *sess, dua_conn_t conn);
  * shorthand for dua_unit_set(sess, uid, -1, DUA_PARAM_UMT_EXEC_GEN, &mode, 4). */
 comatose_result_t dua_set_umt_mode(dua_session_t *sess,
                                    dua_uid_t uid, uint32_t mode);
+
+/* configure TDM channel-to-FIFO assignment on the CSS.
+ * sends a UMT_IMMEDIATE bytecode blob that maps num_channels TDM timeslots
+ * to DSP FIFOs. must be called before TDM grant.
+ * fxs_uid: any allocated FXS unit UID.
+ * tdm_id: TDM bus index (0 for HT818).
+ * num_channels: total FXS channels (8 for HT818). */
+comatose_result_t dua_set_tdm_assignment(dua_session_t *sess,
+                                         dua_uid_t fxs_uid,
+                                         int tdm_id, int num_channels);
 
 /*
  * low-level message building (for exploration / discovery commands)

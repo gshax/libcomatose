@@ -103,11 +103,16 @@ typedef struct {
  * line feed states (for IFX_TAPI_LINE_FEED_SET)
  */
 enum tapi_line_feed {
-	IFX_TAPI_LINE_FEED_STANDBY      = 0,
-	IFX_TAPI_LINE_FEED_ACTIVE       = 1,
-	IFX_TAPI_LINE_FEED_ACTIVE_REV   = 2,  /* reversed polarity */
-	IFX_TAPI_LINE_FEED_DISABLED     = 3,
-	/* additional states may exist -- these are the known-used ones */
+	IFX_TAPI_LINE_FEED_ACTIVE       = 0,  /* normal feeding, phone off-hook */
+	IFX_TAPI_LINE_FEED_ACTIVE_REV   = 1,  /* reversed polarity */
+	IFX_TAPI_LINE_FEED_STANDBY      = 2,  /* on-hook standby */
+	IFX_TAPI_LINE_FEED_HIGH_IMPEDANCE = 3,  /* line off, device powered */
+	IFX_TAPI_LINE_FEED_DISABLED     = 4,  /* line and device off */
+	IFX_TAPI_LINE_FEED_GROUND_START = 5,
+	IFX_TAPI_LINE_FEED_NORMAL_AUTO  = 6,  /* normal with auto battery switch */
+	IFX_TAPI_LINE_FEED_REVERSED_AUTO = 7,
+	IFX_TAPI_LINE_FEED_NORMAL_LOW   = 8,
+	IFX_TAPI_LINE_FEED_REVERSED_LOW = 9,
 };
 
 /*

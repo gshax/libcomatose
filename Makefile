@@ -22,7 +22,7 @@ libcomatose.a: $(OBJS)
 tools: libcomatose.a $(TOOLS)
 
 tools/%: tools/%.c libcomatose.a
-	$(CC) $(CFLAGS) -o $@ $< -L. -lcomatose
+	$(CC) $(CFLAGS) -static -o $@ $< -L. -lcomatose
 
 clean:
 	rm -f $(OBJS) libcomatose.a $(TOOLS)

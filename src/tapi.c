@@ -41,6 +41,32 @@ static int ensure_dev_node(const char *path, int major, int minor)
 }
 
 /*
+ * helper: look up a char device major number from /proc/devices
+ * returns major number or -1 on failure
+ */
+static int find_major(const char *name)
+{
+	FILE *f = fopen("/proc/devices", "r");
+	if (!f)
+		return -1;
+
+	char line[128];
+	int major = -1;
+	while (fgets(line, sizeof(line), f)) {
+		int num;
+		char devname[64];
+		if (sscanf(line, " %d %63s", &num, devname) == 2) {
+			if (strcmp(devname, name) == 0) {
+				major = num;
+				break;
+			}
+		}
+	}
+	fclose(f);
+	return major;
+}
+
+/*
  * BSP
  */
 
@@ -49,7 +75,12 @@ comatose_result_t tapi_bsp_init(tapi_bsp_t **out, ht_bsp_init_result_t *info)
 	if (!out)
 		return COMATOSE_ERR_INVALID;
 
-	if (ensure_dev_node(TAPI_DEV_BSP, TAPI_MAJOR_BSP, 0) < 0)
+	/* look up BSP major dynamically since it varies between environments */
+	int bsp_major = find_major("slic_bsp");
+	if (bsp_major < 0)
+		bsp_major = TAPI_MAJOR_BSP; /* fallback to compiled-in default */
+
+	if (ensure_dev_node(TAPI_DEV_BSP, bsp_major, 0) < 0)
 		return COMATOSE_ERR_IOCTL;
 
 	int fd = open(TAPI_DEV_BSP, O_RDWR);

@@ -1,2 +1,20 @@
 *.o
 *.a
+*.so
+*.ko
+*.mod.c
+*.mod.o
+*.order
+*.symvers
+.tmp_versions/
+
+# built tools (keep .c sources)
+tools/bsp_init
+tools/coma_test
+tools/css_shell
+tools/dua_enumerate
+tools/dua_intercom
+tools/dua_probe
+tools/tdm_brute
+tools/tdm_diag
+kmod/.*cmd

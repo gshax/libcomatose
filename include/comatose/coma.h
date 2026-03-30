@@ -52,6 +52,10 @@ static inline void *cmsg_payload(struct cmsg *msg) {
 /* opaque connection handle */
 typedef struct coma_conn coma_conn_t;
 
+/* check if the CSS is loaded and not in panic state.
+ * returns 1 if CSS is ready, 0 if not. */
+int coma_css_ready(void);
+
 /* connect to a named COMA service (e.g. "dua", "voice").
  * requires CAP_SYS_ADMIN or CAP_NET_ADMIN. */
 coma_conn_t *coma_connect(const char *service);

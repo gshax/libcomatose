@@ -1,10 +1,14 @@
 /*
  * coma.c - COMA socket transport implementation
+ *
+ * IMPORTANT: the COMA kernel socket has a quirk where recv() returns
+ * EOPNOTSUPP but recvmsg() works fine. always use recvmsg() internally.
  */
 
 #include <comatose/coma.h>
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -16,14 +20,32 @@ struct coma_conn {
 	char service[COMA_SERVICE_NAME_MAX];
 };
 
+int coma_css_ready(void)
+{
+	FILE *f = fopen("/sys/devices/platform/8000000.css/state", "r");
+	if (!f)
+		return 0;
+	char state[32] = {0};
+	if (!fgets(state, sizeof(state), f)) {
+		fclose(f);
+		return 0;
+	}
+	fclose(f);
+	/* trim newline */
+	state[strcspn(state, "\n")] = 0;
+	return strcmp(state, "loaded") == 0;
+}
+
 coma_conn_t *coma_connect(const char *service)
 {
 	if (!service || strlen(service) >= COMA_SERVICE_NAME_MAX)
 		return NULL;
 
 	int fd = socket(PF_COMA, SOCK_SEQPACKET, 0);
-	if (fd < 0)
+	if (fd < 0) {
+		fprintf(stderr, "coma: socket() failed: %s\n", strerror(errno));
 		return NULL;
+	}
 
 	struct sockaddr_coma addr;
 	memset(&addr, 0, sizeof(addr));
@@ -31,6 +53,8 @@ coma_conn_t *coma_connect(const char *service)
 	strncpy(addr.service, service, COMA_SERVICE_NAME_MAX - 1);
 
 	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		fprintf(stderr, "coma: connect(\"%s\") failed: %s\n",
+		        service, strerror(errno));
 		close(fd);
 		return NULL;
 	}
@@ -71,7 +95,18 @@ ssize_t coma_recv(coma_conn_t *conn, void *buf, size_t buflen)
 {
 	if (!conn || conn->fd < 0)
 		return -1;
-	return recv(conn->fd, buf, buflen, 0);
+
+	/*
+	 * must use recvmsg() — the COMA kernel socket's recvmsg handler
+	 * works correctly, but plain recv() hits an EOPNOTSUPP path.
+	 */
+	struct iovec iov = { .iov_base = buf, .iov_len = buflen };
+	struct msghdr mh;
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+
+	return recvmsg(conn->fd, &mh, 0);
 }
 
 comatose_result_t coma_transact(coma_conn_t *conn,
