@@ -7,15 +7,10 @@
 *.order
 *.symvers
 .tmp_versions/
-
-# built tools (keep .c sources)
-tools/bsp_init
-tools/coma_test
-tools/css_shell
-tools/dua_enumerate
-tools/dua_intercom
-tools/dua_probe
-tools/tdm_brute
-tools/tdm_diag
-tools/voice_tap
 kmod/.*cmd
+
+# compiled tool binaries (keep .c sources)
+# match any file in tools/ that doesn't have an extension
+tools/[a-z]*
+!tools/*.c
+!tools/*.h
