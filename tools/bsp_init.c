@@ -50,7 +50,7 @@ int main(int argc, char *argv[])
 			else
 				printf("port %d: active\n", i);
 		} else {
-			printf("port %d: initialized (standby)\n", i);
+			printf("port %d: initialized\n", i);
 		}
 
 		/* don't close -- in a real app we'd keep these open */

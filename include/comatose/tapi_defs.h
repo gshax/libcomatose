@@ -100,16 +100,32 @@ typedef struct {
 #define VINETIC_GR909_RESULT              0x4e11
 
 /*
- * line feed states (for IFX_TAPI_LINE_FEED_SET)
+ * line feed states (for IFX_TAPI_LINE_FEED_SET ioctl 0x7101)
+ *
+ * WARNING: only value 0 (ACTIVE) is empirically verified to work.
+ * values 2, 4, 21 all return ioctl success but produce no observable
+ * hardware change (no dmesg, no voltage change). the block appears to
+ * be in drv_tapi.ko's dispatch, not in drv_silabs.ko's ProSLIC mapping.
+ *
+ * drv_silabs.ko has a value→ProSLIC state mapping (at 0x000401d4) but
+ * it's unclear if drv_tapi.ko actually calls into it for non-zero values.
+ * the GS stock firmware (gs_ata) may use a different ioctl or code path
+ * to control line feed. needs further investigation.
+ *
+ * empirically verified (2026-03-31):
+ *   value 0:  works — sets battery hot (ProSLIC FWD_ACTIVE)
+ *   value 2:  no effect (ioctl returns 0, no hardware change)
+ *   value 4:  no effect
+ *   value 21: no effect
  */
 enum tapi_line_feed {
-	IFX_TAPI_LINE_FEED_ACTIVE       = 0,  /* normal feeding, phone off-hook */
-	IFX_TAPI_LINE_FEED_ACTIVE_REV   = 1,  /* reversed polarity */
-	IFX_TAPI_LINE_FEED_STANDBY      = 2,  /* on-hook standby */
-	IFX_TAPI_LINE_FEED_HIGH_IMPEDANCE = 3,  /* line off, device powered */
-	IFX_TAPI_LINE_FEED_DISABLED     = 4,  /* line and device off */
+	IFX_TAPI_LINE_FEED_ACTIVE       = 0,  /* VERIFIED: battery hot, phone operational */
+	IFX_TAPI_LINE_FEED_ACTIVE_REV   = 1,  /* untested */
+	IFX_TAPI_LINE_FEED_STANDBY      = 2,  /* BROKEN: no effect (same as ACTIVE internally?) */
+	IFX_TAPI_LINE_FEED_HIGH_IMPEDANCE = 3,  /* untested */
+	IFX_TAPI_LINE_FEED_DISABLED     = 4,  /* BROKEN: no effect */
 	IFX_TAPI_LINE_FEED_GROUND_START = 5,
-	IFX_TAPI_LINE_FEED_NORMAL_AUTO  = 6,  /* normal with auto battery switch */
+	IFX_TAPI_LINE_FEED_NORMAL_AUTO  = 6,
 	IFX_TAPI_LINE_FEED_REVERSED_AUTO = 7,
 	IFX_TAPI_LINE_FEED_NORMAL_LOW   = 8,
 	IFX_TAPI_LINE_FEED_REVERSED_LOW = 9,

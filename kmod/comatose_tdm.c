@@ -26,13 +26,20 @@
 #define SERVICE_NAME "tdm"
 #define CFIFO_SIZE   1024
 
+/*
+ * the kernel source has: {type, id, cookie, channels, sample_size, rate}
+ * but the kernel fills msg.rate=rate (field at offset 20) and msg.cookie=0
+ * (field at offset 8). if the CSS actually expects {type, id, rate, channels,
+ * sample_size, cookie}, then the kernel's "bug" puts everything in the right
+ * place. let's try this layout:
+ */
 struct tdm_msg_grant {
 	uint32_t type;
 	uint32_t id;
-	uint32_t cookie;
+	uint32_t rate;
 	uint32_t channels;
 	uint32_t sample_size;
-	uint32_t rate;
+	uint32_t cookie;
 } __attribute__((__packed__));
 
 struct tdm_msg_nack {
@@ -96,20 +103,25 @@ static int send_grant_and_wait(unsigned int id, unsigned int rate,
 	reinit_completion(&tdm_reply);
 	last_response_type = -1;
 
-	cmsg = coma_cmsg_alloc(service_id, service_id, 0,
-	                       sizeof(struct tdm_msg_grant));
+	cmsg = coma_cmsg_alloc(service_id, service_id, 0, 5 * sizeof(uint32_t));
 	if (IS_ERR(cmsg)) {
 		mutex_unlock(&tdm_mutex);
 		return PTR_ERR(cmsg);
 	}
 
-	msg = cmsg_payload(cmsg);
-	msg->type = TDM_GRANT;
-	msg->id = id;
-	msg->cookie = 0;
-	msg->channels = channels;
-	msg->sample_size = sample_size;
-	msg->rate = rate;
+	/* try: 5-word message with no cookie field at all.
+	 * maybe the CSS expects exactly {type, id, rate, channels, sample_size}
+	 * and a 6th word confuses it. */
+	{
+		uint32_t *raw = cmsg_payload(cmsg);
+		raw[0] = TDM_GRANT;
+		raw[1] = id;
+		raw[2] = rate;
+		raw[3] = channels;
+		raw[4] = sample_size;
+		pr_info("comatose_tdm: wire(5w): %08x %08x %08x %08x %08x\n",
+		        raw[0], raw[1], raw[2], raw[3], raw[4]);
+	}
 
 	ret = coma_cmsg_commit(service_id);
 	if (ret < 0) {

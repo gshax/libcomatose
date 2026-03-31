@@ -17,4 +17,5 @@ tools/dua_intercom
 tools/dua_probe
 tools/tdm_brute
 tools/tdm_diag
+tools/voice_tap
 kmod/.*cmd
