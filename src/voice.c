@@ -82,28 +82,43 @@ comatose_result_t voice_stop(int fd)
 	return COMATOSE_OK;
 }
 
-void voice_config_g711u(rtp_session_config *cfg, int line_id, int session_id)
+static void voice_config_common(rtp_session_config *cfg, int line_id,
+                                int session_id)
 {
 	memset(cfg, 0, sizeof(*cfg));
-
-	cfg->codec.tx_pt = RTP_PT_G711U;
 	cfg->codec.tx_pt_event = 0xff;
 	cfg->codec.rx_pt_event = 0xff;
-	cfg->codec.duration = 20;
 	cfg->codec.opts = RTP_CODEC_OPT_NONE;
-	strncpy(cfg->codec.CodecStr, "pcmu/8000",
-	        sizeof(cfg->codec.CodecStr) - 1);
-
-	cfg->codec.rx_list[0].rx_pt = RTP_PT_G711U;
-	strncpy(cfg->codec.rx_list[0].CodecStr, "pcmu/8000",
-	        sizeof(cfg->codec.rx_list[0].CodecStr) - 1);
-	for (int i = 1; i < VOICE_MAX_CODECS; i++)
+	for (int i = 0; i < VOICE_MAX_CODECS; i++)
 		cfg->codec.rx_list[i].rx_pt = (char)0xff;
-
 	cfg->opts = RTP_OPT_NONE;
 	cfg->audio_mode = RTP_MODE_ACTIVE;
 	cfg->lib_rtp_mode = RTP_APP_VOIP_USER;
 	cfg->voip_line_id = line_id;
 	cfg->session_id = session_id;
 	cfg->SymmRTPTxPktCnt = 10;
+}
+
+void voice_config_g711u(rtp_session_config *cfg, int line_id, int session_id)
+{
+	voice_config_common(cfg, line_id, session_id);
+	cfg->codec.tx_pt = RTP_PT_G711U;
+	cfg->codec.duration = 20;
+	strncpy(cfg->codec.CodecStr, "pcmu/8000",
+	        sizeof(cfg->codec.CodecStr) - 1);
+	cfg->codec.rx_list[0].rx_pt = RTP_PT_G711U;
+	strncpy(cfg->codec.rx_list[0].CodecStr, "pcmu/8000",
+	        sizeof(cfg->codec.rx_list[0].CodecStr) - 1);
+}
+
+void voice_config_l16(rtp_session_config *cfg, int line_id, int session_id)
+{
+	voice_config_common(cfg, line_id, session_id);
+	cfg->codec.tx_pt = 96;  /* dynamic PT */
+	cfg->codec.duration = 20;
+	strncpy(cfg->codec.CodecStr, "L16/16000",
+	        sizeof(cfg->codec.CodecStr) - 1);
+	cfg->codec.rx_list[0].rx_pt = 96;
+	strncpy(cfg->codec.rx_list[0].CodecStr, "L16/16000",
+	        sizeof(cfg->codec.rx_list[0].CodecStr) - 1);
 }

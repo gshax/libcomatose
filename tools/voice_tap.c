@@ -10,6 +10,8 @@
  *   --raw:     strip RTP/CFIFO headers, output only codec payload bytes
  *   --dump:    hex dump packets to stderr instead of writing stdout
  *   --client:  client mode — just open /dev/voiceN, no hardware setup
+ *   --l16:     use L16/16000 codec (default)
+ *   --g711u:   use G.711u codec instead of L16
  */
 
 #include <comatose/comatose.h>
@@ -118,7 +120,7 @@ static void capture_loop(int voice_fd, int port, int raw_mode, int dump_mode)
 /*
  * client mode: comatose_dsp owns the hardware, we just open /dev/voiceN
  */
-static int run_client(int port, int raw_mode, int dump_mode)
+static int run_client(int port, int raw_mode, int dump_mode, int use_g711u)
 {
 	fprintf(stderr, "=== voice_tap: port %d (client mode) ===\n", port);
 
@@ -136,7 +138,10 @@ static int run_client(int port, int raw_mode, int dump_mode)
 	}
 
 	rtp_session_config cfg;
-	voice_config_g711u(&cfg, port, port);
+	if (use_g711u)
+		voice_config_g711u(&cfg, port, port);
+	else
+		voice_config_l16(&cfg, port, port);
 	comatose_result_t r = voice_set_codec(voice_fd, &cfg);
 	if (r != COMATOSE_OK) {
 		fprintf(stderr, "voice_set_codec failed: %s (errno=%d)\n",
@@ -145,7 +150,7 @@ static int run_client(int port, int raw_mode, int dump_mode)
 		if (tp) { tapi_line_feed_set(tp, IFX_TAPI_LINE_FEED_STANDBY); tapi_port_close(tp); }
 		return 1;
 	}
-	fprintf(stderr, "  codec: G.711u, 20ms\n");
+	fprintf(stderr, "  codec: %s, 20ms\n", use_g711u ? "G.711u" : "L16/16000");
 
 	capture_loop(voice_fd, port, raw_mode, dump_mode);
 
@@ -158,7 +163,7 @@ static int run_client(int port, int raw_mode, int dump_mode)
 /*
  * standalone mode: full hardware init (original behavior, using library APIs)
  */
-static int run_standalone(int port, int raw_mode, int dump_mode)
+static int run_standalone(int port, int raw_mode, int dump_mode, int use_g711u)
 {
 	fprintf(stderr, "=== voice_tap: port %d (standalone) ===\n", port);
 
@@ -217,14 +222,17 @@ static int run_standalone(int port, int raw_mode, int dump_mode)
 	}
 
 	rtp_session_config cfg;
-	voice_config_g711u(&cfg, port, port);
+	if (use_g711u)
+		voice_config_g711u(&cfg, port, port);
+	else
+		voice_config_l16(&cfg, port, port);
 	r = voice_set_codec(voice_fd, &cfg);
 	if (r != COMATOSE_OK) {
 		fprintf(stderr, "voice_set_codec failed: %s (errno=%d)\n",
 		        result_str(r), errno);
 		goto cleanup;
 	}
-	fprintf(stderr, "  codec: G.711u, 20ms\n");
+	fprintf(stderr, "  codec: %s, 20ms\n", use_g711u ? "G.711u" : "L16/16000");
 
 	capture_loop(voice_fd, port, raw_mode, dump_mode);
 
@@ -246,6 +254,7 @@ int main(int argc, char *argv[])
 	int raw_mode = 0;
 	int dump_mode = 0;
 	int client_mode = 0;
+	int use_g711u = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--raw") == 0)
@@ -254,6 +263,10 @@ int main(int argc, char *argv[])
 			dump_mode = 1;
 		else if (strcmp(argv[i], "--client") == 0)
 			client_mode = 1;
+		else if (strcmp(argv[i], "--g711u") == 0)
+			use_g711u = 1;
+		else if (strcmp(argv[i], "--l16") == 0)
+			use_g711u = 0;
 		else if (argv[i][0] != '-')
 			port = atoi(argv[i]);
 	}
@@ -267,7 +280,7 @@ int main(int argc, char *argv[])
 	signal(SIGTERM, sighandler);
 
 	if (client_mode)
-		return run_client(port, raw_mode, dump_mode);
+		return run_client(port, raw_mode, dump_mode, use_g711u);
 	else
-		return run_standalone(port, raw_mode, dump_mode);
+		return run_standalone(port, raw_mode, dump_mode, use_g711u);
 }

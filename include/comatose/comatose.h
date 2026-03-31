@@ -21,5 +21,6 @@
 #include <comatose/dua.h>
 #include <comatose/tapi.h>
 #include <comatose/voice.h>
+#include <comatose/bgsc.h>
 
 #endif /* COMATOSE_H */

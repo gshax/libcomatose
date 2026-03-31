@@ -78,6 +78,7 @@ int main(int argc, char *argv[])
 	tapi_port_t *ports[COMATOSE_MAX_FXS_PORTS] = {0};
 	dua_session_t *sess = NULL;
 	comatose_hw_state_t hw = {0};
+	bgsc_ctx_t *bgsc = NULL;
 	int num_fxs = 0;
 	int ret = 1;
 
@@ -166,8 +167,21 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "  (skipped — rely on external app_dsp)\n");
 	} else {
 		fprintf(stderr, "\n--- BGSC ---\n");
-		fprintf(stderr, "  TODO: not yet implemented\n");
-		fprintf(stderr, "  use --no-bgsc and run stock app_dsp for now\n");
+		void *shm = no_dua_init ? NULL : dua_shm_ptr(sess);
+		if (!shm) {
+			fprintf(stderr, "  no shared memory pointer (need DUA init for BGSC)\n");
+			fprintf(stderr, "  use --no-bgsc if running with external app_dsp\n");
+			goto cleanup;
+		}
+		bgsc = bgsc_init(shm);
+		if (!bgsc) {
+			fprintf(stderr, "  bgsc_init failed\n");
+			goto cleanup;
+		}
+		if (bgsc_start(bgsc) != 0) {
+			fprintf(stderr, "  bgsc_start failed\n");
+			goto cleanup;
+		}
 	}
 
 	/* --- ready --- */
@@ -183,6 +197,10 @@ int main(int argc, char *argv[])
 	fprintf(stderr, "\n--- shutting down ---\n");
 
 cleanup:
+	/* stop BGSC */
+	if (bgsc)
+		bgsc_stop(bgsc);
+
 	/* standby all lines */
 	for (int i = 0; i < num_fxs; i++) {
 		if (ports[i])

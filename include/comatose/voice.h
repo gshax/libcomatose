@@ -35,4 +35,9 @@ comatose_result_t voice_stop(int fd);
  * session_id: voice device minor number (typically == line_id). */
 void voice_config_g711u(rtp_session_config *cfg, int line_id, int session_id);
 
+/* build a minimal rtp_session_config for L16 (linear 16-bit PCM, 16kHz, 20ms).
+ * uses dynamic payload type 96. this is the target codec for comatose_dsp's
+ * BGSC implementation (trivial passthrough, no actual encoding needed). */
+void voice_config_l16(rtp_session_config *cfg, int line_id, int session_id);
+
 #endif /* COMATOSE_VOICE_H */

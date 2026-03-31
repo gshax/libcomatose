@@ -3,7 +3,7 @@ AR ?= ar
 CFLAGS ?= -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Wpedantic -O2
 CFLAGS += -Iinclude
 
-SRCS = src/coma.c src/dua.c src/tapi.c src/voice.c
+SRCS = src/coma.c src/dua.c src/tapi.c src/voice.c src/bgsc.c
 OBJS = $(SRCS:.c=.o)
 
 TOOL_SRCS = $(wildcard tools/*.c)
@@ -22,7 +22,7 @@ libcomatose.a: $(OBJS)
 tools: libcomatose.a $(TOOLS)
 
 tools/%: tools/%.c libcomatose.a
-	$(CC) $(CFLAGS) -static -o $@ $< -L. -lcomatose
+	$(CC) $(CFLAGS) -static -o $@ $< -L. -lcomatose -lpthread
 
 clean:
 	rm -f $(OBJS) libcomatose.a $(TOOLS)
