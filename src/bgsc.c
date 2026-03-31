@@ -1,30 +1,27 @@
 /*
- * bgsc.c - minimal BGSC (background scheduler) implementation
+ * bgsc.c - BGSC (background scheduler) implementation for L16 passthrough
  *
- * replaces stock app_dsp's ARM-side codec processing for L16 passthrough.
+ * replaces stock app_dsp's ARM-side DSP processing. for L16 (linear 16-bit
+ * PCM), the ARM codec function is literally a no-op — the CSS handles data
+ * movement internally. the ARM only needs to:
  *
- * the BGSC system has 4 BG levels (0-3). level 0 runs on the CSS, levels
- * 1-3 run on the ARM. each level has a flow table (FTAB) with codec entries
- * and a state machine that progresses through startup to IDLE.
+ *   1. initialize shared memory (ring buffer header, codec state area,
+ *      version tag)
+ *   2. build the FTAB (flow table) in process memory with correct control
+ *      word pointers into shared memory
+ *   3. run the dispatch loop: read control words, acknowledge activation
+ *      bits, maintain state machine
+ *   4. send ring buffer messages: "level ready" after startup, periodic
+ *      heartbeat ticks
  *
- * this implementation focuses on the infrastructure: state machine transitions,
- * ring buffer messaging, heartbeat ticks, and FTAB entry dispatch. it does
- * NOT implement actual codec functions — L16 (linear PCM passthrough) is
- * handled by the CSS directly once the infrastructure is running.
+ * the FTAB has 320 entries organized as 16 groups of 20 (one group per
+ * SPVOIPNDA unit). within each group, entry[0] is the codec slot and
+ * entries[1-19] are signal processing helpers. for L16, ALL entries are
+ * no-ops — we just process control words without calling any functions.
  *
- * shared memory layout (from RE of app_dsp and live dumps):
- *
- * pool header:
- *   +0x04: pool_size (uint32, set by dua_init_hw)
- *   +0x08: alloc_watermark (uint32, advances as CSS allocates)
- *   +0x10: dsp_version (uint32, checked by p_dsp_app_startup)
- *   +0x14: version_tag (uint32, written by app_dsp after init)
- *   +0x28: saved_alloc_ptr (uint32, set by app_dsp)
- *   +0x2c: codec_state_ptr (uint32, set by app_dsp)
- *
- * app_dsp allocations (starting at alloc_watermark):
- *   +0x00: ARM→CSS ring buffer header (0x10 bytes)
- *   +0x10: codec state area (0x79c bytes)
+ * control word offsets in shared memory follow a regular pattern:
+ * group N starts at base_offset + N * 0xb6c, with 20 fixed relative
+ * offsets within each group.
  */
 
 #include <comatose/bgsc.h>
@@ -45,204 +42,179 @@
 #define SHM_SAVED_ALLOC    0x28
 #define SHM_CODEC_STATE    0x2c
 
-/* expected DSP version (from p_dsp_app_startup) */
-#define DSP_VERSION_EXPECTED  0x11400154
-
 /* allocation sizes */
 #define RINGBUF_HDR_SIZE   0x10
 #define CODEC_STATE_SIZE   0x79c
-#define RINGBUF_ENTRIES    487  /* 0x1e7 */
+#define RINGBUF_ENTRIES    487   /* 0x1e7 */
 
-/* ring buffer structure in shared memory */
-struct shm_ringbuf {
-	uint32_t *base;
-	uint32_t *end;
-	uint32_t *write_ptr;
-	uint32_t *read_ptr;
-};
-
-/* FTAB entry (flow table entry) */
-struct ftab_entry {
-	uint32_t *control_word;
-	void     *param1;
-	void     *param2;
-	void     *calc_func;
-};
-
-/* per-level DFL processing state */
-struct dfl_level {
-	uint32_t *flow_table;    /* pointer to flow table in shared memory */
-	int       state;         /* state machine state */
-	uint32_t  tick_divisor;  /* heartbeat tick divisor (level 0 only) */
-	uint32_t  tick_counter;  /* current tick count */
-};
+/*
+ * element descriptor table location in shared memory.
+ * the CSS creates 368 DSP element descriptors during DUA init and stores
+ * pointers to them in a table at a FIXED offset (shm+0xb854). each pointer
+ * is a userspace virtual address pointing into shared memory. the first
+ * word at each pointed-to location is the control word for that element.
+ *
+ * the table has 368 entries organized as groups of ~23 per SPVOIPNDA unit,
+ * but the exact within-group offsets and group stride vary between boots
+ * (depends on CSS allocation order). we read the table at runtime.
+ */
+#define ELEM_TABLE_OFF     0xb854  /* fixed offset in shared memory */
+#define ELEM_TABLE_COUNT   368     /* number of elements */
 
 struct bgsc_ctx {
-	void *shm;                    /* shared memory base */
-	uint32_t *ringbuf_area;       /* our allocation in shm */
-	struct shm_ringbuf *css2arm;  /* CSS→ARM ring buffer (set up by CSS) */
-	struct shm_ringbuf arm2css;   /* ARM→CSS ring buffer (we init) */
+	void *shm;
+	uintptr_t shm_mmap_base;       /* userspace mmap address of shm */
 
-	struct dfl_level levels[4];
-	pthread_t threads[3];         /* BG levels 1-3 */
+	/* ring buffer state */
+	uint32_t rb_hdr_off;
+	uint32_t rb_data_off;
+	uint32_t rb_data_end;
+	uint32_t rb_write_off;
+
+	/* control word pointers — read from element table at runtime */
+	volatile uint32_t *control_words[ELEM_TABLE_COUNT];
+	int num_control_words;
+
+	pthread_t threads[3];           /* BG levels 1-3 */
 	volatile int running;
 };
 
-static inline uint32_t shm_read32(void *shm, int offset)
+static inline uint32_t shm_read32(void *shm, uint32_t offset)
 {
 	return *(volatile uint32_t *)((char *)shm + offset);
 }
 
-static inline void shm_write32(void *shm, int offset, uint32_t val)
+static inline void shm_write32(void *shm, uint32_t offset, uint32_t val)
 {
 	*(volatile uint32_t *)((char *)shm + offset) = val;
 	__sync_synchronize();
 }
 
 /*
- * ARM→CSS ring buffer messaging
+ * ring buffer — writes directly to shared memory so CSS can read
+ *
+ * the ring buffer header is 4 uint32 values at the allocated area:
+ *   [0] = base pointer (shm-relative)
+ *   [1] = end pointer (shm-relative)
+ *   [2] = write pointer (shm-relative, updated by ARM)
+ *   [3] = read pointer (shm-relative, updated by CSS)
+ *
+ * message data follows immediately after the header.
  */
-static void ringbuf_init(struct shm_ringbuf *rb, uint32_t *base, int num_entries)
+
+struct ringbuf {
+	void     *shm;          /* shared memory base */
+	uint32_t  hdr_off;      /* offset of header in shm */
+	uint32_t  data_off;     /* offset of data area in shm */
+	uint32_t  data_end;     /* end offset of data area */
+	uint32_t  write_off;    /* current write offset */
+};
+
+static void ringbuf_init(struct ringbuf *rb, void *shm,
+                         uint32_t hdr_off, uint32_t data_off, int num_entries)
 {
-	rb->base = base;
-	rb->end = base + num_entries;
-	rb->write_ptr = base;
-	rb->read_ptr = base;
+	rb->shm = shm;
+	rb->hdr_off = hdr_off;
+	rb->data_off = data_off;
+	rb->data_end = data_off + (uint32_t)num_entries * 4;
+	rb->write_off = data_off;
+
+	/* write header to shared memory */
+	shm_write32(shm, hdr_off + 0x00, data_off);      /* base */
+	shm_write32(shm, hdr_off + 0x04, rb->data_end);  /* end */
+	shm_write32(shm, hdr_off + 0x08, data_off);      /* write_ptr */
+	shm_write32(shm, hdr_off + 0x0c, data_off);      /* read_ptr */
 }
 
-/* send a short message (instance, type, param) — 3 words */
-static int ringbuf_send_short(struct shm_ringbuf *rb,
-                              uint32_t instance, int type, uint32_t param)
+static void ringbuf_write_word(struct ringbuf *rb, uint32_t val)
 {
-	uint32_t *wp = rb->write_ptr;
-
-	/* check space (simplified — no wrap check for initial impl) */
-	if (wp + 3 >= rb->end)
-		wp = rb->base;  /* wrap */
-
-	wp[0] = instance;
-	wp[1] = ((uint32_t)type << 13) | 1;
-	wp[2] = param;
-	__sync_synchronize();
-	rb->write_ptr = wp + 3;
-	return 0;
+	if (rb->write_off >= rb->data_end)
+		rb->write_off = rb->data_off;  /* wrap */
+	shm_write32(rb->shm, rb->write_off, val);
+	rb->write_off += 4;
 }
 
-/* send heartbeat tick — 2 words (no params) */
-static int ringbuf_send_tick(struct shm_ringbuf *rb)
+static void ringbuf_commit(struct ringbuf *rb)
 {
-	uint32_t *wp = rb->write_ptr;
+	/* update write pointer in header so CSS sees the new data */
+	shm_write32(rb->shm, rb->hdr_off + 0x08, rb->write_off);
+}
 
-	if (wp + 2 >= rb->end)
-		wp = rb->base;
+/* send "level ready" message: [0, (1<<13)|1, level] */
+static void ringbuf_send_level_ready(struct ringbuf *rb, int level)
+{
+	ringbuf_write_word(rb, 0);
+	ringbuf_write_word(rb, (1 << 13) | 1);
+	ringbuf_write_word(rb, (uint32_t)level);
+	ringbuf_commit(rb);
+}
 
-	wp[0] = 0;
-	wp[1] = (4 << 13) | 0;
-	__sync_synchronize();
-	rb->write_ptr = wp + 2;
-	return 0;
+/* send heartbeat tick: [0, (4<<13)|0] */
+static void ringbuf_send_tick(struct ringbuf *rb)
+{
+	ringbuf_write_word(rb, 0);
+	ringbuf_write_word(rb, (4 << 13) | 0);
+	ringbuf_commit(rb);
 }
 
 /*
- * FTAB dispatch — iterate flow table entries and process control words
+ * FTAB dispatch — process control words from the element table
+ *
+ * the CSS creates 368 DSP element descriptors during DUA init. each
+ * descriptor has a control word as its first field. we read the control
+ * word pointers from the element table at shm+0xb854 during init.
+ *
+ * when the CSS needs the ARM to process something, it sets bits on a
+ * control word. our dispatch reads these words and acknowledges them.
+ * for L16 passthrough, no actual codec work is needed — just protocol.
+ *
+ * dispatch protocol (from RE of dfl_process_flow):
+ *   bit 0 (0x01): ACTIVE
+ *   bits 1-4: pending work (0x14 = SwitchInstance activation)
+ *   bit 5 (0x20): PREPARE_RUN
+ *   bit 7 (0x80): ALT_PREPARE
+ *   after processing: set to (val & 6) ? 1 : 0
  */
-static void ftab_dispatch(uint32_t *flow_table)
+static int dispatch_log_count = 0;
+
+static void ftab_dispatch(struct bgsc_ctx *ctx)
 {
-	if (!flow_table)
-		return;
+	for (int i = 0; i < ctx->num_control_words; i++) {
+		volatile uint32_t *cw = ctx->control_words[i];
+		if (!cw)
+			continue;
 
-	/* FTAB list is at flow_table + 0x0c (offset in words: 3) */
-	struct ftab_entry *list = *(struct ftab_entry **)(flow_table + 3);
-	if (!list)
-		return;
-
-	struct ftab_entry *cur = list;
-	while (cur->control_word != NULL) {
-		volatile uint32_t *cw = (volatile uint32_t *)cur->control_word;
 		uint32_t val = *cw;
+		if (val == 0)
+			continue;
 
-		if (val & 0x1f) {
-			/* entry has pending work — process it.
-			 * for L16 passthrough: the CSS handles the actual data movement.
-			 * we just need to acknowledge the control word. */
+		/* only process small values that look like control words */
+		if (val > 0x3ff)
+			continue;
 
-			/* clear activation bits, set to "active" or "done" */
-			if (val & 1) {
-				/* already active — call would go to calc_func.
-				 * for our purposes, just leave it running. */
-			} else {
-				/* pending activation (bits 5, 7) — acknowledge it */
-				*cw = 1;
-				__sync_synchronize();
-			}
+		uint32_t new_val = (val & 6) ? 1 : 0;
+
+		if (dispatch_log_count < 50) {
+			uint32_t off = (uint32_t)((char *)cw - (char *)ctx->shm);
+			fprintf(stderr, "bgsc: dispatch[%d] shm+0x%05x: 0x%x -> 0x%x\n",
+			        i, off, val, new_val);
+			dispatch_log_count++;
 		}
 
-		/* advance to next entry (entries are 16 bytes = 4 words) */
-		cur++;
+		/* acknowledge: clear activation bits per dispatch protocol.
+		 * also set element+4 (status word) to signal processing done.
+		 * the stock dsp_sko calc function reads and updates this field. */
+		*cw = new_val;
+		if (val & 0x14) {
+			/* SwitchInstance activation (bits 2/4) — update status */
+			*(cw + 1) = 1;
+		}
+		__sync_synchronize();
 	}
 }
 
 /*
- * dfl_calc — per-level state machine + dispatch
- */
-static void dfl_calc(struct bgsc_ctx *ctx, int level)
-{
-	struct dfl_level *lv = &ctx->levels[level];
-	int state = lv->state;
-
-	/* state machine progression: 2 → 3 → 4/5 → 0x200 → 1 (IDLE) */
-	switch (state) {
-	case 2:
-		lv->state = 3;
-		break;
-
-	case 3:
-		/* for levels 1-3: set up I-switch bits on FTAB entries */
-		if (level == 0)
-			lv->state = 4;
-		else
-			lv->state = 0x200;
-		break;
-
-	case 4:
-		lv->state = 5;
-		break;
-
-	case 5:
-		lv->state = 0x200;
-		break;
-
-	case 0x200:
-		/* send "level ready" message to CSS */
-		ringbuf_send_short(&ctx->arm2css, 0, 1, (uint32_t)level);
-		lv->state = 1;
-		break;
-
-	case 1:
-		/* IDLE — dispatch FTAB entries */
-		break;
-
-	default:
-		break;
-	}
-
-	/* dispatch flow table if not in startup transition */
-	if (lv->state == 1 || (state >= 0x100 && state < 0x200)) {
-		ftab_dispatch(lv->flow_table);
-	}
-
-	/* level 0 only: periodic heartbeat */
-	if (level == 0 && lv->tick_divisor > 0) {
-		lv->tick_counter--;
-		if (lv->tick_counter == 0) {
-			lv->tick_counter = lv->tick_divisor;
-			ringbuf_send_tick(&ctx->arm2css);
-		}
-	}
-}
-
-/*
- * BG thread — calls dfl_calc periodically
+ * BG thread
  */
 struct thread_args {
 	bgsc_ctx_t *ctx;
@@ -256,13 +228,12 @@ static void *bg_thread(void *arg)
 	int level = ta->level;
 	free(ta);
 
-	/* 5ms period for all levels (conservative — stock uses variable rates) */
-	struct timespec period = { .tv_sec = 0, .tv_nsec = 5000000 };
+	struct timespec period = { .tv_sec = 0, .tv_nsec = 5000000 }; /* 5ms */
 
 	fprintf(stderr, "bgsc: level %d thread started\n", level);
 
 	while (ctx->running) {
-		dfl_calc(ctx, level);
+		ftab_dispatch(ctx);
 		nanosleep(&period, NULL);
 	}
 
@@ -284,54 +255,78 @@ bgsc_ctx_t *bgsc_init(void *shm_ptr)
 		return NULL;
 	ctx->shm = shm_ptr;
 
-	/* read current allocation watermark */
+	ctx->shm_mmap_base = (uintptr_t)shm_ptr;
+
+	/* read shared memory state */
 	uint32_t alloc_wm = shm_read32(shm_ptr, SHM_ALLOC_WM);
-	fprintf(stderr, "bgsc: shm alloc watermark at 0x%x\n", alloc_wm);
-
-	/* check DSP version */
 	uint32_t ver = shm_read32(shm_ptr, SHM_DSP_VERSION);
-	fprintf(stderr, "bgsc: DSP version 0x%08x\n", ver);
-
-	/* save current watermark (like app_dsp does at +0x28) */
-	shm_write32(shm_ptr, SHM_SAVED_ALLOC, alloc_wm);
-
-	/* allocate ring buffer header (0x10 bytes) from pool */
-	ctx->ringbuf_area = (uint32_t *)((char *)shm_ptr + alloc_wm);
-	alloc_wm += RINGBUF_HDR_SIZE;
-
-	/* save codec state pointer (like app_dsp does at +0x2c) */
-	shm_write32(shm_ptr, SHM_CODEC_STATE, alloc_wm);
-
-	/* allocate codec state area (0x79c bytes) */
-	uint32_t *codec_state = (uint32_t *)((char *)shm_ptr + alloc_wm);
-	memset(codec_state, 0, CODEC_STATE_SIZE);
-	alloc_wm += CODEC_STATE_SIZE;
-
-	/* update watermark */
-	shm_write32(shm_ptr, SHM_ALLOC_WM, alloc_wm);
-
-	/* init ARM→CSS ring buffer in the allocated area */
-	ringbuf_init(&ctx->arm2css, ctx->ringbuf_area, RINGBUF_ENTRIES);
+	fprintf(stderr, "bgsc: shm alloc watermark=0x%x, DSP version=0x%08x\n",
+	        alloc_wm, ver);
 
 	/* write version tag (like app_dsp: shm+0x14 = version) */
 	shm_write32(shm_ptr, SHM_VERSION_TAG, ver);
 
-	/* init level state machines — all start at state 2 */
-	for (int i = 0; i < 4; i++) {
-		ctx->levels[i].state = 2;
-		ctx->levels[i].tick_divisor = 0x10;  /* heartbeat every 16 ticks */
-		ctx->levels[i].tick_counter = 0x10;
+	/* allocate ring buffer from shared memory pool.
+	 * layout: [header: 0x10] [data: 0x79c]
+	 * header contains USERSPACE VIRTUAL ADDRESSES for CSS MMU translation. */
+	uint32_t hdr_off = alloc_wm;
+	uint32_t data_off = alloc_wm + RINGBUF_HDR_SIZE;
+	uint32_t data_end_off = data_off + RINGBUF_ENTRIES * 4;
+
+	shm_write32(shm_ptr, SHM_SAVED_ALLOC, hdr_off);
+	shm_write32(shm_ptr, SHM_CODEC_STATE, data_off);
+	memset((char *)shm_ptr + data_off, 0, RINGBUF_ENTRIES * 4);
+
+	uintptr_t data_vaddr = (uintptr_t)shm_ptr + data_off;
+	uintptr_t data_end_vaddr = (uintptr_t)shm_ptr + data_end_off;
+	shm_write32(shm_ptr, hdr_off + 0x00, (uint32_t)data_vaddr);
+	shm_write32(shm_ptr, hdr_off + 0x04, (uint32_t)data_end_vaddr);
+	shm_write32(shm_ptr, hdr_off + 0x08, (uint32_t)data_vaddr);
+	shm_write32(shm_ptr, hdr_off + 0x0c, (uint32_t)data_vaddr);
+
+	shm_write32(shm_ptr, SHM_ALLOC_WM, data_end_off);
+
+	ctx->rb_hdr_off = hdr_off;
+	ctx->rb_data_off = data_off;
+	ctx->rb_data_end = data_end_off;
+	ctx->rb_write_off = data_off;
+
+	fprintf(stderr, "bgsc: ring buffer at shm+0x%x (vaddr=0x%x)\n",
+	        hdr_off, (uint32_t)data_vaddr);
+
+	/* read element descriptor table at shm+0xb854.
+	 * the CSS creates 368 DSP element descriptors during DUA init.
+	 * each table entry is a userspace virtual address pointing to a
+	 * descriptor in shared memory. the first word of each descriptor
+	 * is the control word we need to monitor. */
+	ctx->num_control_words = 0;
+	fprintf(stderr, "bgsc: shm mmap base = 0x%08x\n",
+	        (uint32_t)ctx->shm_mmap_base);
+
+	for (int i = 0; i < ELEM_TABLE_COUNT; i++) {
+		uint32_t ptr = shm_read32(shm_ptr, ELEM_TABLE_OFF + i * 4);
+		if (ptr == 0)
+			break;
+		/* convert userspace vaddr to local pointer */
+		uintptr_t elem_vaddr = (uintptr_t)ptr;
+		uintptr_t shm_start = ctx->shm_mmap_base;
+		if (elem_vaddr < shm_start || elem_vaddr >= shm_start + 0x100000) {
+			if (i < 5)
+				fprintf(stderr, "bgsc: elem[%d] ptr=0x%08x OUT OF RANGE (shm=0x%08x)\n",
+				        i, ptr, (uint32_t)shm_start);
+			continue;
+		}
+		uint32_t elem_off = (uint32_t)(elem_vaddr - shm_start);
+		ctx->control_words[ctx->num_control_words] =
+			(volatile uint32_t *)((char *)shm_ptr + elem_off);
+		if (i < 5)
+			fprintf(stderr, "bgsc: elem[%d] ptr=0x%08x -> shm+0x%05x (cw=0x%08x)\n",
+			        i, ptr, elem_off,
+			        *(volatile uint32_t *)((char *)shm_ptr + elem_off));
+		ctx->num_control_words++;
 	}
-
-	/* try to find flow table pointers from shared memory.
-	 * the CSS writes these during DUA init. the flow table
-	 * pointer locations depend on the CSS firmware layout.
-	 * for now, we leave them NULL and rely on the CSS to
-	 * manage FTAB dispatch internally for L16. */
-
-	fprintf(stderr, "bgsc: initialized (ringbuf at shm+0x%lx, codec_state at shm+0x%lx)\n",
-	        (unsigned long)((char *)ctx->ringbuf_area - (char *)shm_ptr),
-	        (unsigned long)((char *)codec_state - (char *)shm_ptr));
+	fprintf(stderr, "bgsc: read %d control words from element table\n",
+	        ctx->num_control_words);
 
 	return ctx;
 }
@@ -343,9 +338,22 @@ int bgsc_start(bgsc_ctx_t *ctx)
 
 	ctx->running = 1;
 
-	/* run level 0 state machine inline (CSS level, just needs messages) */
-	for (int i = 0; i < 10; i++)
-		dfl_calc(ctx, 0);
+	/* send "level ready" messages for all 4 levels */
+	for (int i = 0; i < 4; i++) {
+		/* write message: [0, (1<<13)|1, level] */
+		shm_write32(ctx->shm, ctx->rb_write_off, 0);
+		ctx->rb_write_off += 4;
+		shm_write32(ctx->shm, ctx->rb_write_off, (1 << 13) | 1);
+		ctx->rb_write_off += 4;
+		shm_write32(ctx->shm, ctx->rb_write_off, (uint32_t)i);
+		ctx->rb_write_off += 4;
+
+		/* update write pointer in header (as userspace vaddr) */
+		uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
+		shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
+
+		fprintf(stderr, "bgsc: sent level %d ready\n", i);
+	}
 
 	/* spawn threads for levels 1-3 */
 	for (int i = 0; i < 3; i++) {
@@ -357,7 +365,6 @@ int bgsc_start(bgsc_ctx_t *ctx)
 		pthread_attr_t attr;
 		pthread_attr_init(&attr);
 
-		/* try to set realtime priority (may fail without CAP_SYS_NICE) */
 		struct sched_param sp = { .sched_priority = 50 - i };
 		pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
 		pthread_attr_setschedparam(&attr, &sp);
@@ -365,7 +372,6 @@ int bgsc_start(bgsc_ctx_t *ctx)
 
 		int ret = pthread_create(&ctx->threads[i], &attr, bg_thread, ta);
 		if (ret != 0) {
-			/* retry without RT priority */
 			pthread_attr_init(&attr);
 			ret = pthread_create(&ctx->threads[i], &attr, bg_thread, ta);
 			if (ret != 0) {
