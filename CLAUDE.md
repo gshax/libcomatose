@@ -43,7 +43,6 @@ header-only definition files (`*_defs.h`) can be used independently.
 - `css_shell` — CSS debug console client (`-c "command"` or interactive)
 - `coma_test` — low-level COMA socket connectivity test
 - `bsp_init` — BSP and SLIC initialization
-- `ht818-exec.sh` — remote command execution via telnet (legacy, use ssh instead)
 
 ## critical implementation notes
 
@@ -57,13 +56,6 @@ operation result arrives later as an async callback (cmd=0x7f). our current code
 returns "OK" from the sync response and ignores the async callbacks, which masks
 real errors. the stock `libcordless.so` has `p_duasync_*` wrappers that use a
 mutex + `duasync_coma_wait()` to block until the async result arrives.
-
-**current workaround:** generous `usleep()` delays between operations. the async
-callback logging (stderr) shows real results: `p[3] = result * 0x100 + type`,
-where negative results are DUA error codes.
-
-**TODO:** implement proper sync wrappers that wait for the matching async callback
-before returning, similar to stock's `p_duasync_UnitSetReq` pattern.
 
 ### DUA initialization sequence
 the CSS firmware requires a specific init order before DUA commands work:

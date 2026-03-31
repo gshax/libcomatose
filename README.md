@@ -24,10 +24,6 @@ shared memory init, DUA service registration, unit allocation (all 8 FXS + VOIP)
 UMT DSP pipeline configuration, connection creation and merging, SLIC line power.
 the CSS debug shell works for interactive diagnostics.
 
-**current blocker:** TDM bus grant — the CSS rejects all channel counts because
-its TDM instance data isn't initialized. investigating the kernel-side TDM/ALSA
-initialization path.
-
 ## building
 
 ```
