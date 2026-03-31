@@ -28,9 +28,9 @@ static comatose_result_t do_dua_setup(void)
 		usleep(50000);
 	}
 
-	/* UMT FXS init all */
+	/* UMT FXS DSP pipeline init (mode 1) — creates FIFOs for TDM */
 	for (int i = 0; i < 8; i++) {
-		r = dua_set_umt_mode(sess, fxs[i], DUA_UMT_FXS_INIT);
+		r = dua_set_umt_mode(sess, fxs[i], DUA_UMT_FXS_DSP_PIPELINE);
 		if (r != COMATOSE_OK) { dua_close(sess); return r; }
 		usleep(50000);
 	}

@@ -296,9 +296,25 @@ enum dua_sm {
 #define DUA_UMT_SPVOIP_WB_40MS_ALT   6  /* wideband, 40ms (variant) */
 #define DUA_UMT_SPVOIP_MINIMAL       7  /* minimal/passthrough (no codec install) */
 
-/* UT_FXS modes */
-#define DUA_UMT_FXS_INIT             0  /* full FXS init */
-#define DUA_UMT_FXS_CFG_A            1  /* FXS reconfiguration A */
+/* UT_FXS modes (genModes table at 0x02035998 in _css.elf)
+ *
+ * mode 1 (CFG_A) is what the stock lib_dua_init() runs on every FXS unit
+ * BEFORE sending the TDM assignment. it sets up the per-port DSP pipeline
+ * (tone generators, codecs, FIFOs) using UMT opcodes 26, 10, 9.
+ * the DSP FIFOs created by this mode are what TDM assignment maps to —
+ * without running mode 1 first, UMT_IMMEDIATE TDM bytecode is accepted
+ * but has no effect because the target FIFOs don't exist yet.
+ *
+ * stock init order per FXS unit:
+ *   1. UnitAllocateReq(type=2, spec=i)
+ *   2. UnitSetReq(uid, elem=-2, UMT_EXEC_GEN, mode=1)  ← THIS
+ *   3. UnitSetReq(uid, elem=0x13, USM_DO, dtmf_config)
+ *   4. UnitSetReq(uid, elem=0x3b, USM_DO, 1)
+ *   5. UnitConnectReq(uid, -3)
+ *   6. UnitSetReq(uid, elem=-1, CBK_FUNC, callback_ptr)
+ */
+#define DUA_UMT_FXS_INIT             0  /* full FXS cold-start init */
+#define DUA_UMT_FXS_DSP_PIPELINE     1  /* DSP pipeline setup (REQUIRED before TDM) */
 #define DUA_UMT_FXS_CFG_B            2  /* FXS reconfiguration B */
 
 /* pin element IDs (each unit has two pins for bidirectional audio) */

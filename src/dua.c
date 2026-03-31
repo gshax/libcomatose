@@ -34,6 +34,10 @@ struct dua_session {
 	uint8_t resp_buf[DUA_RESP_BUF_SIZE];
 	size_t resp_len;
 	int32_t last_dua_error;
+	/* async callback result from last completed operation */
+	int32_t last_async_result;
+	dua_uid_t last_async_uid;
+	int32_t last_async_elem;
 	/* shared memory state */
 	int shm_fd;
 	void *shm_ptr;
@@ -85,6 +89,31 @@ int32_t dua_last_error(const dua_session_t *sess)
 	return sess ? sess->last_dua_error : 0;
 }
 
+const uint8_t *dua_resp_buf(const dua_session_t *sess)
+{
+	return sess ? sess->resp_buf : NULL;
+}
+
+size_t dua_resp_len(const dua_session_t *sess)
+{
+	return sess ? sess->resp_len : 0;
+}
+
+int32_t dua_last_async_result(const dua_session_t *sess)
+{
+	return sess ? sess->last_async_result : 0;
+}
+
+int32_t dua_last_async_elem(const dua_session_t *sess)
+{
+	return sess ? sess->last_async_elem : 0;
+}
+
+void *dua_shm_ptr(const dua_session_t *sess)
+{
+	return sess ? sess->shm_ptr : NULL;
+}
+
 /*
  * low-level message building
  */
@@ -123,15 +152,82 @@ comatose_result_t dua_transact(dua_session_t *sess,
 }
 
 /*
+ * async callback decoding
+ *
+ * the CSS sends async callbacks (cmd=0x7f) with 4 params:
+ *   p[0] = 0xdeadbeef (our callback reference from InitReq)
+ *   p[1] = uid
+ *   p[2] = elem
+ *   p[3] = result * 0x100 + response_type
+ *
+ * response_type: 1=connect, 2=set/allocate/free, 3=init
+ * result: >= 0 success (e.g. 0x0b=SET_IND, 0x09=ALLOCATE_IND), < 0 DUA error
+ */
+static int32_t dua_decode_async_result(uint32_t p3)
+{
+	return (int32_t)(p3 & 0xFFFFFF00u) >> 8;
+}
+
+static void dua_log_async(const struct dua_msg *resp)
+{
+	if (resp->num_params >= 4) {
+		int32_t result = dua_decode_async_result(resp->params[3]);
+		fprintf(stderr, "  [async] uid=0x%x elem=%d result=%d (p3=0x%x)\n",
+		        resp->params[1], (int32_t)resp->params[2],
+		        result, resp->params[3]);
+	}
+}
+
+/*
+ * receive one message from the CSS, store in session resp_buf.
+ * returns the cmd field, or -1 on error/timeout.
+ */
+static int dua_recv_one(dua_session_t *sess, int timeout_ms)
+{
+	struct pollfd pfd = {
+		.fd = coma_fd(sess->conn),
+		.events = POLLIN,
+	};
+
+	int ret = poll(&pfd, 1, timeout_ms);
+	if (ret <= 0)
+		return -1;
+
+	ssize_t n = coma_recv(sess->conn, sess->resp_buf, DUA_RESP_BUF_SIZE);
+	if (n < 0)
+		return -1;
+	sess->resp_len = (size_t)n;
+
+	if (sess->resp_len < DUA_MSG_HEADER_SIZE)
+		return -1;
+
+	return (int)((struct dua_msg *)sess->resp_buf)->cmd;
+}
+
+/*
  * request/reply engine
  *
- * sends a DUA message and waits for the matching sync response (cmd=0x81)
- * with the same sender_id. any async callbacks (cmd=0x7f) received in
- * the meantime are logged and discarded.
+ * sends a DUA message and waits for BOTH:
+ *   1. the sync response (cmd=0x81) confirming receipt
+ *   2. the async callback (cmd=0x7f) with the actual operation result
+ *
+ * match_uid: uid to match in async callback p[1], or -1 to skip async wait.
+ *
+ * this unified loop prevents the race where the async callback arrives
+ * during the sync wait and gets discarded.
  */
+/*
+ * async callback response types (low byte of p[3])
+ */
+#define DUA_ASYNC_TYPE_CONNECT  1   /* UnitConnect/Disconnect, ConnCreate/Delete/Merge */
+#define DUA_ASYNC_TYPE_SET      2   /* UnitSet, UnitAllocate, UnitFree */
+#define DUA_ASYNC_TYPE_INIT     3   /* InitReq, ApplInit */
+
 static comatose_result_t dua_send_and_wait(dua_session_t *sess,
                                            const void *msg, size_t msg_len,
                                            uint32_t expected_sender_id,
+                                           int32_t match_uid,
+                                           int match_type,
                                            int timeout_ms)
 {
 	if (timeout_ms < 0)
@@ -141,53 +237,61 @@ static comatose_result_t dua_send_and_wait(dua_session_t *sess,
 	if (sent < 0)
 		return COMATOSE_ERR_SOCKET;
 
-	for (int attempts = 0; attempts < 32; attempts++) {
-		struct pollfd pfd = {
-			.fd = coma_fd(sess->conn),
-			.events = POLLIN,
-		};
+	int got_sync = 0;
+	int got_async = (match_uid == -1); /* skip async if no uid to match */
+	comatose_result_t async_result = COMATOSE_OK;
 
-		int ret = poll(&pfd, 1, timeout_ms);
-		if (ret < 0)
-			return COMATOSE_ERR_SOCKET;
-		if (ret == 0)
-			return COMATOSE_ERR_TIMEOUT;
-
-		ssize_t n = coma_recv(sess->conn, sess->resp_buf, DUA_RESP_BUF_SIZE);
-		if (n < 0)
-			return COMATOSE_ERR_SOCKET;
-		sess->resp_len = (size_t)n;
-
-		if (sess->resp_len < DUA_MSG_HEADER_SIZE)
-			continue;
+	for (int attempts = 0; attempts < 64; attempts++) {
+		int cmd = dua_recv_one(sess, timeout_ms);
+		if (cmd < 0)
+			return got_sync ? COMATOSE_ERR_TIMEOUT : COMATOSE_ERR_SOCKET;
 
 		struct dua_msg *resp = (struct dua_msg *)sess->resp_buf;
 
-		if (resp->cmd == DUA_RESP_CMD_ASYNC) {
-			/* async callback — log and skip */
-			continue;
-		}
+		if (cmd == DUA_RESP_CMD_SYNC) {
+			if (resp->sender_id != expected_sender_id)
+				continue; /* stale */
 
-		if (resp->cmd == DUA_RESP_CMD_SYNC) {
-			if (resp->sender_id == expected_sender_id) {
-				/* matched! check for DUA error */
-				sess->last_dua_error = 0;
-				if (resp->num_params >= 1 &&
-				    sess->resp_len >= DUA_MSG_HEADER_SIZE + 4) {
-					int32_t result = (int32_t)resp->params[0];
-					if (result < 0) {
-						sess->last_dua_error = result;
-						return COMATOSE_ERR_DUA;
-					}
+			/* check for immediate rejection */
+			if (resp->num_params >= 1 &&
+			    sess->resp_len >= DUA_MSG_HEADER_SIZE + 4) {
+				int32_t result = (int32_t)resp->params[0];
+				if (result < 0) {
+					sess->last_dua_error = result;
+					return COMATOSE_ERR_DUA;
 				}
-				return COMATOSE_OK;
 			}
-			/* response for a different sender_id — stale, skip */
+			got_sync = 1;
+			if (got_async)
+				return async_result;
 			continue;
 		}
 
-		/* unknown cmd — skip */
-		continue;
+		if (cmd == DUA_RESP_CMD_ASYNC && resp->num_params >= 4 &&
+		    resp->params[0] == 0xdeadbeef) {
+			dua_log_async(resp);
+
+			int32_t cb_uid = (int32_t)resp->params[1];
+			int cb_type = (int)(resp->params[3] & 0xFF);
+
+			/* skip warnings (result >= 0x1000) and param events —
+			 * they share type codes with real completions but aren't
+			 * the operation result we're waiting for */
+			int32_t result = dua_decode_async_result(resp->params[3]);
+			if (!got_async && cb_uid == match_uid &&
+			    (match_type < 0 || cb_type == match_type) &&
+			    (result < 0 || result < 0x1000)) {
+				sess->last_async_result = result;
+				sess->last_async_uid = (dua_uid_t)resp->params[1];
+				sess->last_async_elem = (int32_t)resp->params[2];
+				sess->last_dua_error = result < 0 ? result : 0;
+				async_result = result >= 0 ? COMATOSE_OK : COMATOSE_ERR_DUA;
+				got_async = 1;
+				if (got_sync)
+					return async_result;
+			}
+			continue;
+		}
 	}
 
 	return COMATOSE_ERR_TIMEOUT;
@@ -220,7 +324,7 @@ static comatose_result_t dua_simple_cmd(dua_session_t *sess,
 		off = dua_msg_pack_u32(buf, off, __builtin_va_arg(ap, uint32_t));
 	__builtin_va_end(ap);
 
-	return dua_send_and_wait(sess, buf, off, sid, DUA_DEFAULT_TIMEOUT_MS);
+	return dua_send_and_wait(sess, buf, off, sid, -1, -1, DUA_DEFAULT_TIMEOUT_MS);
 }
 
 /*
@@ -286,12 +390,29 @@ comatose_result_t dua_init_hw(dua_session_t *sess)
 	off = dua_msg_pack_u32(buf, off, 0xdeadbeef);
 	off = dua_msg_pack_u32(buf, off, (uint32_t)(uintptr_t)sess->shm_ptr);
 
-	return dua_send_and_wait(sess, buf, off, sid, DUA_DEFAULT_TIMEOUT_MS);
+	return dua_send_and_wait(sess, buf, off, sid, -1, -1, DUA_DEFAULT_TIMEOUT_MS);
 }
 
 comatose_result_t dua_appl_init(dua_session_t *sess)
 {
-	return dua_simple_cmd(sess, DUA_CMD_APPL_INIT, 0);
+	comatose_result_t ret = dua_simple_cmd(sess, DUA_CMD_APPL_INIT, 0);
+	if (ret != COMATOSE_OK)
+		return ret;
+
+	/* drain async callbacks from InitReq/ApplInit.
+	 * these arrive asynchronously and will confuse the uid-matching
+	 * in dua_send_and_wait if they're still queued. */
+	for (int i = 0; i < 16; i++) {
+		int cmd = dua_recv_one(sess, 500);
+		if (cmd < 0)
+			break; /* no more pending messages */
+		struct dua_msg *resp = (struct dua_msg *)sess->resp_buf;
+		if (cmd == DUA_RESP_CMD_ASYNC)
+			dua_log_async(resp);
+	}
+	fprintf(stderr, "  (drained init callbacks)\n");
+
+	return COMATOSE_OK;
 }
 
 comatose_result_t dua_unit_allocate(dua_session_t *sess,
@@ -302,18 +423,28 @@ comatose_result_t dua_unit_allocate(dua_session_t *sess,
 	if (!sess || !out_uid)
 		return COMATOSE_ERR_INVALID;
 
-	comatose_result_t ret = dua_simple_cmd(sess, DUA_CMD_UNIT_ALLOCATE, 2,
-	                                       (uint32_t)(int16_t)type,
-	                                       (uint32_t)instance_spec);
-	if (ret != COMATOSE_OK)
-		return ret;
+	dua_uid_t expected = DUA_UID_MAKE(type, instance_spec >= 0 ? instance_spec : 0);
 
-	if (instance_spec >= 0)
+	uint8_t buf[DUA_MSG_BUF_SIZE];
+	uint32_t sid = sess->next_sender_id++;
+	size_t off = dua_msg_init(buf, sizeof(buf), sid, DUA_CMD_UNIT_ALLOCATE, 2);
+	off = dua_msg_pack_u32(buf, off, (uint32_t)(int16_t)type);
+	off = dua_msg_pack_u32(buf, off, (uint32_t)instance_spec);
+
+	/* wait for both sync response AND the UNITALLOCATE_IND async callback */
+	comatose_result_t ret = dua_send_and_wait(sess, buf, off, sid,
+	                                          (int32_t)expected,
+	                                          DUA_ASYNC_TYPE_SET,
+	                                          DUA_DEFAULT_TIMEOUT_MS);
+
+	if (ret == COMATOSE_OK)
+		*out_uid = sess->last_async_uid;
+	else if (instance_spec >= 0)
 		*out_uid = DUA_UID_MAKE(type, instance_spec);
 	else
 		*out_uid = DUA_UID_MAKE(type, 0);
 
-	return COMATOSE_OK;
+	return ret;
 }
 
 comatose_result_t dua_unit_free(dua_session_t *sess, dua_uid_t uid)
@@ -375,7 +506,26 @@ comatose_result_t dua_unit_set(dua_session_t *sess,
 		}
 	}
 
-	return dua_send_and_wait(sess, buf, off, sid, DUA_DEFAULT_TIMEOUT_MS);
+	/* debug: dump wire bytes for large-blob UnitSet */
+	if (data_len > 4) {
+		fprintf(stderr, "dua_unit_set: uid=0x%04x elem=%d param=0x%x data_len=%zu off=%zu sid=%u\n",
+		        (unsigned)uid, elem, param, data_len, off, sid);
+		fprintf(stderr, "  msg[0..31]:");
+		for (size_t i = 0; i < 32 && i < off; i++)
+			fprintf(stderr, " %02x", buf[i]);
+		fprintf(stderr, "\n  blob[0..15]:");
+		if (data) {
+			const uint8_t *d = data;
+			for (size_t i = 0; i < 16 && i < data_len; i++)
+				fprintf(stderr, " %02x", d[i]);
+		}
+		fprintf(stderr, "\n");
+	}
+
+	return dua_send_and_wait(sess, buf, off, sid,
+	                        (int32_t)(int16_t)uid,
+	                        DUA_ASYNC_TYPE_SET,
+	                        DUA_DEFAULT_TIMEOUT_MS);
 }
 
 comatose_result_t dua_unit_get(dua_session_t *sess,
@@ -432,8 +582,18 @@ comatose_result_t dua_conn_delete(dua_session_t *sess, dua_conn_t conn)
 comatose_result_t dua_unit_connect(dua_session_t *sess,
                                    dua_uid_t uid, dua_conn_t conn)
 {
-	return dua_simple_cmd(sess, DUA_CMD_UNIT_CONNECT, 2,
-	                      (uint32_t)(int16_t)uid, (uint32_t)conn);
+	uint8_t buf[DUA_MSG_BUF_SIZE];
+	uint32_t sid = sess->next_sender_id++;
+	size_t off = dua_msg_init(buf, sizeof(buf), sid, DUA_CMD_UNIT_CONNECT, 2);
+	off = dua_msg_pack_u32(buf, off, (uint32_t)(int16_t)uid);
+	off = dua_msg_pack_u32(buf, off, (uint32_t)conn);
+
+	/* the async callback elem field contains the assigned conn_id,
+	 * readable via sess->last_async_elem after return. */
+	return dua_send_and_wait(sess, buf, off, sid,
+	                         (int32_t)(int16_t)uid,
+	                         DUA_ASYNC_TYPE_CONNECT,
+	                         DUA_DEFAULT_TIMEOUT_MS);
 }
 
 comatose_result_t dua_unit_disconnect(dua_session_t *sess,
@@ -458,7 +618,10 @@ comatose_result_t dua_conn_unmerge(dua_session_t *sess, dua_conn_t conn)
 comatose_result_t dua_set_umt_mode(dua_session_t *sess,
                                    dua_uid_t uid, uint32_t mode)
 {
-	return dua_unit_set(sess, uid, -1, DUA_PARAM_UMT_EXEC_GEN,
+	/* stock firmware uses elem=-2 for UMT mode execution.
+	 * elem is not used by GenSetFunc for UMT dispatch, but we match
+	 * the stock behavior exactly (elem=-2 = SETTOG). */
+	return dua_unit_set(sess, uid, -2, DUA_PARAM_UMT_EXEC_GEN,
 	                    &mode, sizeof(mode));
 }
 
@@ -503,7 +666,7 @@ static uint8_t *emit_exec_func(uint8_t *p, int elem,
 #define TDM_FIFO_STRIDE    0x12
 
 comatose_result_t dua_set_tdm_assignment(dua_session_t *sess,
-                                         dua_uid_t fxs_uid,
+										 dua_uid_t uid,
                                          int tdm_id, int num_channels)
 {
 	if (!sess || num_channels < 0 || num_channels > 16)
@@ -532,6 +695,6 @@ comatose_result_t dua_set_tdm_assignment(dua_session_t *sess,
 
 	size_t blob_size = (size_t)(p - blob);
 
-	return dua_unit_set(sess, fxs_uid, -2, DUA_PARAM_UMT_IMMEDIATE,
+	return dua_unit_set(sess, uid, -2, DUA_PARAM_UMT_IMMEDIATE,
 	                    blob, blob_size);
 }

@@ -33,6 +33,19 @@ int dua_fd(const dua_session_t *sess);
  * only meaningful after a function returns COMATOSE_ERR_DUA. */
 int32_t dua_last_error(const dua_session_t *sess);
 
+/* get fields from the last async callback.
+ * after dua_unit_connect, last_async_elem is the assigned conn_id.
+ * after dua_unit_allocate, last_async_uid is the confirmed uid. */
+int32_t dua_last_async_result(const dua_session_t *sess);
+int32_t dua_last_async_elem(const dua_session_t *sess);
+
+/* access the raw response buffer from the last DUA transaction (for debugging). */
+const uint8_t *dua_resp_buf(const dua_session_t *sess);
+size_t dua_resp_len(const dua_session_t *sess);
+
+/* get the DUA shared memory pointer (CSS-visible address). */
+void *dua_shm_ptr(const dua_session_t *sess);
+
 /*
  * initialization
  */
@@ -106,7 +119,9 @@ comatose_result_t dua_conn_unmerge(dua_session_t *sess, dua_conn_t conn);
  */
 
 /* set UMT (DSP pipeline) mode on a unit.
- * shorthand for dua_unit_set(sess, uid, -1, DUA_PARAM_UMT_EXEC_GEN, &mode, 4). */
+ * shorthand for dua_unit_set(sess, uid, -2, DUA_PARAM_UMT_EXEC_GEN, &mode, 4).
+ * for FXS units, mode DUA_UMT_FXS_DSP_PIPELINE (1) MUST be run before TDM
+ * assignment — it creates the DSP FIFOs that TDM maps timeslots to. */
 comatose_result_t dua_set_umt_mode(dua_session_t *sess,
                                    dua_uid_t uid, uint32_t mode);
 
@@ -117,7 +132,7 @@ comatose_result_t dua_set_umt_mode(dua_session_t *sess,
  * tdm_id: TDM bus index (0 for HT818).
  * num_channels: total FXS channels (8 for HT818). */
 comatose_result_t dua_set_tdm_assignment(dua_session_t *sess,
-                                         dua_uid_t fxs_uid,
+                                         dua_uid_t uid,
                                          int tdm_id, int num_channels);
 
 /*
