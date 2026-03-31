@@ -136,6 +136,38 @@ comatose_result_t dua_set_tdm_assignment(dua_session_t *sess,
                                          int tdm_id, int num_channels);
 
 /*
+ * consolidated hardware init / teardown
+ *
+ * dua_full_init replaces the boilerplate scattered across tools:
+ * allocates all FXS/VOIP units, sets DSP pipeline modes, creates
+ * connections, and configures TDM. populates a hw_state struct
+ * with everything needed for teardown.
+ *
+ * does NOT do dua_init_hw/dua_appl_init — call those first.
+ */
+
+typedef struct {
+	int num_fxs;
+	int num_voip;
+	dua_uid_t fxs_uids[COMATOSE_MAX_FXS_PORTS];
+	dua_conn_t fxs_conns[COMATOSE_MAX_FXS_PORTS];
+	dua_uid_t voip_uids[COMATOSE_MAX_VOIP_CH];
+	int tdm_granted;
+} comatose_hw_state_t;
+
+/* allocate units, set modes, create connections, configure TDM.
+ * num_fxs: number of FXS ports (1-8).
+ * num_voip: number of VOIP units (typically == num_fxs for 1:1 mapping).
+ * if num_voip > num_fxs, extra VOIP units are allocated but not connected. */
+comatose_result_t dua_full_init(dua_session_t *sess,
+                                int num_fxs, int num_voip,
+                                comatose_hw_state_t *state);
+
+/* clean teardown: disconnect and free all units. */
+void dua_full_teardown(dua_session_t *sess,
+                       comatose_hw_state_t *state);
+
+/*
  * low-level message building (for exploration / discovery commands)
  */
 

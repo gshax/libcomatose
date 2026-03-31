@@ -30,6 +30,22 @@ comatose_result_t tapi_bsp_init(tapi_bsp_t **out, ht_bsp_init_result_t *info);
 void tapi_bsp_close(tapi_bsp_t *bsp);
 
 /*
+ * consolidated init / teardown
+ */
+
+/* BSP init + open all discovered FXS ports in one call.
+ * ports: array of COMATOSE_MAX_FXS_PORTS pointers (caller provides).
+ * max_ports: size of the ports array.
+ * bsp_info: if non-NULL, populated with BSP discovery results (SLIC/DAA counts).
+ * skip_reset: if true, skip the BSP reset assert/clear sequence.
+ * returns number of FXS ports opened (>= 0), or -1 on fatal error. */
+int tapi_init_all(tapi_port_t **ports, int max_ports,
+                  ht_bsp_init_result_t *bsp_info, int skip_reset);
+
+/* standby all lines and close all ports. num_ports from tapi_init_all return. */
+void tapi_close_all(tapi_port_t **ports, int num_ports);
+
+/*
  * per-port FXS control
  */
 

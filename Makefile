@@ -3,7 +3,7 @@ AR ?= ar
 CFLAGS ?= -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Wpedantic -O2
 CFLAGS += -Iinclude
 
-SRCS = src/coma.c src/dua.c src/tapi.c
+SRCS = src/coma.c src/dua.c src/tapi.c src/voice.c
 OBJS = $(SRCS:.c=.o)
 
 TOOL_SRCS = $(wildcard tools/*.c)

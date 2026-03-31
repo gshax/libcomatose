@@ -665,6 +665,123 @@ static uint8_t *emit_exec_func(uint8_t *p, int elem,
 #define TDM_TX_FIFO_BASE   0x0810
 #define TDM_FIFO_STRIDE    0x12
 
+/*
+ * consolidated hardware init / teardown
+ */
+
+comatose_result_t dua_full_init(dua_session_t *sess,
+                                int num_fxs, int num_voip,
+                                comatose_hw_state_t *state)
+{
+	if (!sess || !state)
+		return COMATOSE_ERR_INVALID;
+	if (num_fxs < 0 || num_fxs > COMATOSE_MAX_FXS_PORTS)
+		return COMATOSE_ERR_INVALID;
+	if (num_voip < 0 || num_voip > COMATOSE_MAX_VOIP_CH)
+		return COMATOSE_ERR_INVALID;
+
+	memset(state, 0, sizeof(*state));
+	state->num_fxs = num_fxs;
+	state->num_voip = num_voip;
+
+	comatose_result_t ret;
+
+	/* allocate FXS units: mode 1 (DSP pipeline) + connect(-3) */
+	for (int i = 0; i < num_fxs; i++) {
+		ret = dua_unit_allocate(sess, DUA_UT_FXS, i, &state->fxs_uids[i]);
+		if (ret != COMATOSE_OK) {
+			fprintf(stderr, "dua_full_init: fxs_alloc[%d] failed\n", i);
+			goto fail;
+		}
+		ret = dua_set_umt_mode(sess, state->fxs_uids[i],
+		                       DUA_UMT_FXS_DSP_PIPELINE);
+		if (ret != COMATOSE_OK) {
+			fprintf(stderr, "dua_full_init: fxs_mode[%d] failed\n", i);
+			goto fail;
+		}
+		ret = dua_unit_connect(sess, state->fxs_uids[i], -3);
+		if (ret != COMATOSE_OK) {
+			fprintf(stderr, "dua_full_init: fxs_connect[%d] failed\n", i);
+			goto fail;
+		}
+		state->fxs_conns[i] = (dua_conn_t)dua_last_async_elem(sess);
+	}
+
+	/* allocate VOIP units: mode 1 (narrowband 20ms) + connect to FXS */
+	for (int i = 0; i < num_voip; i++) {
+		ret = dua_unit_allocate(sess, DUA_UT_SPVOIPNDA, i,
+		                       &state->voip_uids[i]);
+		if (ret != COMATOSE_OK) {
+			fprintf(stderr, "dua_full_init: voip_alloc[%d] failed\n", i);
+			goto fail;
+		}
+		ret = dua_set_umt_mode(sess, state->voip_uids[i],
+		                       DUA_UMT_SPVOIP_NB_20MS);
+		if (ret != COMATOSE_OK) {
+			fprintf(stderr, "dua_full_init: voip_mode[%d] failed\n", i);
+			goto fail;
+		}
+		if (i < num_fxs) {
+			ret = dua_unit_connect(sess, state->voip_uids[i],
+			                      state->fxs_conns[i]);
+			if (ret != COMATOSE_OK) {
+				fprintf(stderr, "dua_full_init: voip_connect[%d] failed\n", i);
+				goto fail;
+			}
+		}
+	}
+
+	/* TDM assignment */
+	ret = dua_set_tdm_assignment(sess, state->fxs_uids[0], 0, num_fxs);
+	if (ret != COMATOSE_OK) {
+		fprintf(stderr, "dua_full_init: tdm_assign failed\n");
+		goto fail;
+	}
+
+	/* TDM grant via procfs */
+	{
+		FILE *f = fopen("/proc/gs/css_own_tdm0", "w");
+		if (!f) {
+			fprintf(stderr, "dua_full_init: tdm grant: %s\n",
+			        strerror(errno));
+		} else {
+			fwrite("1", 1, 1, f);
+			fclose(f);
+			state->tdm_granted = 1;
+		}
+	}
+
+	return COMATOSE_OK;
+
+fail:
+	dua_full_teardown(sess, state);
+	return ret;
+}
+
+void dua_full_teardown(dua_session_t *sess, comatose_hw_state_t *state)
+{
+	if (!sess || !state)
+		return;
+
+	for (int i = state->num_voip - 1; i >= 0; i--) {
+		if (state->voip_uids[i] && i < state->num_fxs)
+			dua_unit_disconnect(sess, state->voip_uids[i],
+			                   state->fxs_conns[i]);
+		if (state->voip_uids[i])
+			dua_unit_free(sess, state->voip_uids[i]);
+	}
+
+	for (int i = state->num_fxs - 1; i >= 0; i--) {
+		if (state->fxs_uids[i])
+			dua_unit_disconnect(sess, state->fxs_uids[i],
+			                   state->fxs_conns[i]);
+		if (state->fxs_uids[i])
+			dua_unit_free(sess, state->fxs_uids[i]);
+	}
+
+	memset(state, 0, sizeof(*state));
+}
+
 comatose_result_t dua_set_tdm_assignment(dua_session_t *sess,
 										 dua_uid_t uid,
                                          int tdm_id, int num_channels)

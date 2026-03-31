@@ -117,6 +117,80 @@ comatose_result_t tapi_bsp_init(tapi_bsp_t **out, ht_bsp_init_result_t *info)
 	return COMATOSE_OK;
 }
 
+/*
+ * consolidated init / teardown
+ */
+
+int tapi_init_all(tapi_port_t **ports, int max_ports,
+                  ht_bsp_init_result_t *bsp_info, int skip_reset)
+{
+	if (!ports || max_ports < 1)
+		return -1;
+
+	/* BSP init (discover hardware config) */
+	tapi_bsp_t *bsp = NULL;
+	ht_bsp_init_result_t info;
+
+	if (skip_reset) {
+		/* still need to query BSP for port count, but skip reset */
+		int bsp_major = find_major("slic_bsp");
+		if (bsp_major < 0)
+			bsp_major = TAPI_MAJOR_BSP;
+		if (ensure_dev_node(TAPI_DEV_BSP, bsp_major, 0) < 0)
+			return -1;
+		int fd = open(TAPI_DEV_BSP, O_RDWR);
+		if (fd < 0)
+			return -1;
+		memset(&info, 0, sizeof(info));
+		if (ioctl(fd, HT_BSP_INIT, &info) < 0) {
+			close(fd);
+			return -1;
+		}
+		close(fd);
+	} else {
+		comatose_result_t r = tapi_bsp_init(&bsp, &info);
+		if (r != COMATOSE_OK)
+			return -1;
+		tapi_bsp_close(bsp);
+	}
+
+	if (bsp_info)
+		*bsp_info = info;
+
+	int num_fxs = info.slic_count * info.slic_channels;
+	if (num_fxs > max_ports)
+		num_fxs = max_ports;
+	if (num_fxs > COMATOSE_MAX_FXS_PORTS)
+		num_fxs = COMATOSE_MAX_FXS_PORTS;
+
+	/* open all FXS ports */
+	for (int i = 0; i < num_fxs; i++) {
+		comatose_result_t r = tapi_port_open(&ports[i], i);
+		if (r != COMATOSE_OK) {
+			fprintf(stderr, "tapi_init_all: port %d open failed\n", i);
+			/* close already-opened ports */
+			for (int j = i - 1; j >= 0; j--)
+				tapi_port_close(ports[j]);
+			return -1;
+		}
+	}
+
+	return num_fxs;
+}
+
+void tapi_close_all(tapi_port_t **ports, int num_ports)
+{
+	if (!ports)
+		return;
+	for (int i = 0; i < num_ports; i++) {
+		if (ports[i]) {
+			tapi_line_feed_set(ports[i], IFX_TAPI_LINE_FEED_STANDBY);
+			tapi_port_close(ports[i]);
+			ports[i] = NULL;
+		}
+	}
+}
+
 void tapi_bsp_close(tapi_bsp_t *bsp)
 {
 	if (!bsp)
