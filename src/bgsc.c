@@ -1,27 +1,31 @@
 /*
- * bgsc.c - BGSC (background scheduler) implementation for L16 passthrough
+ * bgsc.c - BGSC (background scheduler) implementation
  *
- * replaces stock app_dsp's ARM-side DSP processing. for L16 (linear 16-bit
- * PCM), the ARM codec function is literally a no-op — the CSS handles data
- * movement internally. the ARM only needs to:
+ * replaces stock app_dsp's ARM-side DSP framework executor. app_dsp is not a
+ * regular COMA API consumer — it's an outsourced internal subsystem of the CSS
+ * that runs BG processing levels 1-3 on the ARM core. the CSS runs level 0
+ * internally.
  *
- *   1. initialize shared memory (ring buffer header, codec state area,
- *      version tag)
- *   2. build the FTAB (flow table) in process memory with correct control
- *      word pointers into shared memory
- *   3. run the dispatch loop: read control words, acknowledge activation
- *      bits, maintain state machine
- *   4. send ring buffer messages: "level ready" after startup, periodic
- *      heartbeat ticks
+ * the ARM must:
+ *   1. allocate ring buffer + codec state area from the shared memory pool
+ *   2. read the element descriptor table (shm+0xb854) to find control words
+ *   3. run the dispatch loop: read control words, clear pending bits per
+ *      protocol, send decoder ack when the CSS signals a frame
+ *   4. send infrastructure messages: "level ready" at startup, periodic
+ *      heartbeat ticks (~80ms)
  *
- * the FTAB has 320 entries organized as 16 groups of 20 (one group per
- * SPVOIPNDA unit). within each group, entry[0] is the codec slot and
- * entries[1-19] are signal processing helpers. for L16, ALL entries are
- * no-ops — we just process control words without calling any functions.
+ * for L16 (linear 16-bit PCM), the stock calc functions are all effectively
+ * no-ops. the only real per-frame work is the decoder acknowledgement:
+ * when the CSS sets bit 0 of decoder element+8, the ARM sends a type=1 ring
+ * buffer message and clears element+8. this handshake drives frame production.
  *
- * control word offsets in shared memory follow a regular pattern:
- * group N starts at base_offset + N * 0xb6c, with 20 fixed relative
- * offsets within each group.
+ * element table layout: 368 entries at shm+0xb854, organized as groups of
+ * ~24 per SPVOIPNDA unit. within each group, specific positions have defined
+ * roles (from live FTAB dump of stock app_dsp):
+ *   elem[0]  = codec (dsp_sko for L16: pure no-op)
+ *   elem[6]  = encoder status
+ *   elem[21] = decoder (frame counter / ack handshake)
+ *   elem[22] = buffer management
  */
 
 #include <comatose/bgsc.h>
@@ -47,38 +51,18 @@
 #define CODEC_STATE_SIZE   0x79c
 #define RINGBUF_ENTRIES    487   /* 0x1e7 */
 
-/*
- * element descriptor table location in shared memory.
- * the CSS creates 368 DSP element descriptors during DUA init and stores
- * pointers to them in a table at a FIXED offset (shm+0xb854). each pointer
- * is a userspace virtual address pointing into shared memory. the first
- * word at each pointed-to location is the control word for that element.
- *
- * the table has 368 entries organized as groups of ~23 per SPVOIPNDA unit,
- * but the exact within-group offsets and group stride vary between boots
- * (depends on CSS allocation order). we read the table at runtime.
- */
-#define ELEM_TABLE_OFF     0xb854  /* fixed offset in shared memory */
-#define ELEM_TABLE_COUNT   368     /* number of elements */
+/* element descriptor table in shared memory */
+#define ELEM_TABLE_OFF     0xb854
+#define ELEM_TABLE_COUNT   368
 
-struct bgsc_ctx {
-	void *shm;
-	uintptr_t shm_mmap_base;       /* userspace mmap address of shm */
+/* group layout constants */
+#define ELEMS_PER_GROUP    24
+#define MAX_GROUPS         16
 
-	/* ring buffer state */
-	uint32_t rb_hdr_off;
-	uint32_t rb_data_off;
-	uint32_t rb_data_end;
-	uint32_t rb_write_off;
-
-	/* control word pointers — read from element table at runtime */
-	volatile uint32_t *control_words[ELEM_TABLE_COUNT];
-	int num_control_words;
-	uint32_t frame_tick;            /* dispatch cycle counter */
-
-	pthread_t threads[3];           /* BG levels 1-3 */
-	volatile int running;
-};
+/* well-known element positions within each group (from live FTAB analysis) */
+#define ELEM_ENCODER        6   /* encoder: needs init during activation */
+#define ELEM_DECODER       21   /* decoder: frame counter ack handshake */
+#define ELEM_BUFFER        22   /* buffer: byte store during activation */
 
 static inline uint32_t shm_read32(void *shm, uint32_t offset)
 {
@@ -92,23 +76,21 @@ static inline void shm_write32(void *shm, uint32_t offset, uint32_t val)
 }
 
 /*
- * ring buffer — writes directly to shared memory so CSS can read
+ * ring buffer — ARM→CSS messages in shared memory
  *
- * the ring buffer header is 4 uint32 values at the allocated area:
- *   [0] = base pointer (shm-relative)
- *   [1] = end pointer (shm-relative)
- *   [2] = write pointer (shm-relative, updated by ARM)
- *   [3] = read pointer (shm-relative, updated by CSS)
+ * header: 4 x uint32 at the allocated area:
+ *   [0] base_vaddr, [1] end_vaddr, [2] write_vaddr, [3] read_vaddr
+ * data area follows immediately.
  *
- * message data follows immediately after the header.
+ * message format: [instance_id, (type << 13) | num_params, params...]
  */
 
 struct ringbuf {
-	void     *shm;          /* shared memory base */
-	uint32_t  hdr_off;      /* offset of header in shm */
-	uint32_t  data_off;     /* offset of data area in shm */
-	uint32_t  data_end;     /* end offset of data area */
-	uint32_t  write_off;    /* current write offset */
+	void     *shm;
+	uint32_t  hdr_off;
+	uint32_t  data_off;
+	uint32_t  data_end;
+	uint32_t  write_off;
 };
 
 static void ringbuf_init(struct ringbuf *rb, void *shm,
@@ -120,28 +102,30 @@ static void ringbuf_init(struct ringbuf *rb, void *shm,
 	rb->data_end = data_off + (uint32_t)num_entries * 4;
 	rb->write_off = data_off;
 
-	/* write header to shared memory */
-	shm_write32(shm, hdr_off + 0x00, data_off);      /* base */
-	shm_write32(shm, hdr_off + 0x04, rb->data_end);  /* end */
-	shm_write32(shm, hdr_off + 0x08, data_off);      /* write_ptr */
-	shm_write32(shm, hdr_off + 0x0c, data_off);      /* read_ptr */
+	uintptr_t base_vaddr = (uintptr_t)shm + data_off;
+	uintptr_t end_vaddr  = (uintptr_t)shm + rb->data_end;
+
+	shm_write32(shm, hdr_off + 0x00, (uint32_t)base_vaddr);
+	shm_write32(shm, hdr_off + 0x04, (uint32_t)end_vaddr);
+	shm_write32(shm, hdr_off + 0x08, (uint32_t)base_vaddr);
+	shm_write32(shm, hdr_off + 0x0c, (uint32_t)base_vaddr);
 }
 
 static void ringbuf_write_word(struct ringbuf *rb, uint32_t val)
 {
 	if (rb->write_off >= rb->data_end)
-		rb->write_off = rb->data_off;  /* wrap */
+		rb->write_off = rb->data_off;
 	shm_write32(rb->shm, rb->write_off, val);
 	rb->write_off += 4;
 }
 
 static void ringbuf_commit(struct ringbuf *rb)
 {
-	/* update write pointer in header so CSS sees the new data */
-	shm_write32(rb->shm, rb->hdr_off + 0x08, rb->write_off);
+	uintptr_t wp_vaddr = (uintptr_t)rb->shm + rb->write_off;
+	shm_write32(rb->shm, rb->hdr_off + 0x08, (uint32_t)wp_vaddr);
 }
 
-/* send "level ready" message: [0, (1<<13)|1, level] */
+/* [0, (1<<13)|1, level] */
 static void ringbuf_send_level_ready(struct ringbuf *rb, int level)
 {
 	ringbuf_write_word(rb, 0);
@@ -150,7 +134,7 @@ static void ringbuf_send_level_ready(struct ringbuf *rb, int level)
 	ringbuf_commit(rb);
 }
 
-/* send heartbeat tick: [0, (4<<13)|0] */
+/* [0, (4<<13)|0] */
 static void ringbuf_send_tick(struct ringbuf *rb)
 {
 	ringbuf_write_word(rb, 0);
@@ -158,147 +142,285 @@ static void ringbuf_send_tick(struct ringbuf *rb)
 	ringbuf_commit(rb);
 }
 
+/* decoder ack: [elem+8_vaddr, (1<<13)|0] — type=1, 0 params
+ * stock app_dsp sends this when element+8 bit 0 is set by the CSS.
+ * the instance_id is the virtual address of element+8, which the CSS
+ * translates through the shared memory MMU mapping. */
+static void ringbuf_send_decoder_ack(struct ringbuf *rb,
+                                     volatile uint32_t *elem8_ptr)
+{
+	ringbuf_write_word(rb, (uint32_t)(uintptr_t)elem8_ptr);
+	ringbuf_write_word(rb, (1 << 13) | 0);
+	ringbuf_commit(rb);
+}
+
 /*
- * FTAB dispatch — process control words from the element table
+ * element group — one per SPVOIPNDA unit
+ */
+struct elem_group {
+	volatile uint32_t *elems[ELEMS_PER_GROUP];
+	int num_elems;
+};
+
+struct bgsc_ctx {
+	void *shm;
+	uintptr_t shm_mmap_base;
+
+	struct ringbuf rb;
+
+	struct elem_group groups[MAX_GROUPS];
+	int num_groups;
+
+	uint32_t frame_tick;
+	pthread_t threads[3];
+	volatile int running;
+};
+
+/*
+ * encoder element initialization — replicates FUN_00086f50 in stock app_dsp.
  *
- * the CSS creates 368 DSP element descriptors during DUA init. each
- * descriptor has a control word as its first field. we read the control
- * word pointers from the element table at shm+0xb854 during init.
+ * when the CSS activates an encoder element (bits 1-4 set with bit 4 for
+ * POST_CALC_2), the stock dispatch calls the encoder's pending calc which
+ * initializes ~30 fields in the encoder's element descriptor in shared memory.
+ * the CSS reads these fields to confirm the encoder is ready.
  *
- * when the CSS needs the ARM to process something, it sets bits on a
- * control word. our dispatch reads these words and acknowledges them.
- * for L16 passthrough, no actual codec work is needed — just protocol.
+ * the values below are constants extracted from FUN_00086f50's decompilation.
+ * param cw: pointer to the encoder element's control word in shared memory.
+ */
+static void encoder_init(volatile uint32_t *cw)
+{
+	volatile uint16_t *h = (volatile uint16_t *)cw;
+	/* FUN_00086f50 field writes (offsets from cw, as uint16): */
+	h[2]  = 1;       /* +4:  active flag */
+	h[3]  = 1;       /* +6:  active flag */
+	h[4]  = 0;       /* +8:  clear */
+	h[5]  = 0x10;    /* +0xa: config */
+	h[7]  = 0;       /* +0xe */
+	h[8]  = 0;       /* +0x10 */
+	h[9]  = 0;       /* +0x12 */
+	h[10] = 0;       /* +0x14 */
+
+	uint16_t s = h[2]; /* = 1 */
+	h[24] = 6000;    /* +0x30: sample rate related */
+	h[25] = 0x0b;    /* +0x32 */
+	h[26] = 0x19;    /* +0x34 */
+	h[27] = 10;      /* +0x36 */
+	h[28] = 0x21;    /* +0x38 */
+	h[31] = 0xf0;    /* +0x3e */
+	h[15] = 0;       /* +0x1e */
+	h[16] = 0;       /* +0x20 */
+	h[17] = 0;       /* +0x22 */
+	h[18] = 0;       /* +0x24 */
+	h[19] = 0;       /* +0x26 */
+	h[20] = 0;       /* +0x28 */
+	h[21] = 0;       /* +0x2a */
+	h[22] = 5000;    /* +0x2c */
+	h[23] = 5000;    /* +0x2e */
+	h[29] = 0;       /* +0x3a */
+	h[30] = 0;       /* +0x3c */
+
+	/* uint32 writes */
+	volatile uint32_t *w = (volatile uint32_t *)cw;
+	w[16] = 0;       /* +0x40 */
+	w[17] = 0;       /* +0x44 */
+	w[18] = 0;       /* +0x48 */
+	w[40] = 0;       /* +0xa0 */
+	w[41] = 0;       /* +0xa4 */
+	w[42] = 0;       /* +0xa8 */
+
+	h[11] = 0x7fa1;  /* +0x16: threshold */
+	h[12] = s << 4;  /* +0x18 */
+	h[13] = s << 7;  /* +0x1a */
+	h[14] = s * 0x1e;/* +0x1c */
+
+	/* clear 0x54 bytes at +0x4c */
+	memset((void *)(cw + 0x4c/4), 0, 0x54);
+
+	h[54] = 0;       /* +0x6c */
+	h[61] = h[13];   /* +0x7a = value from +0x1a */
+	h[62] = h[14];   /* +0x7c = value from +0x1c */
+
+	__sync_synchronize();
+}
+
+/*
+ * FTAB dispatch — process control words for all element groups
  *
- * dispatch protocol (from RE of dfl_process_flow):
- *   bit 0 (0x01): ACTIVE
- *   bits 1-4: pending work (0x14 = SwitchInstance activation)
- *   bit 5 (0x20): PREPARE_RUN
- *   bit 7 (0x80): ALT_PREPARE
- *   after processing: set to (val & 6) ? 1 : 0
+ * the stock dispatch (dfl_process_flow_asm at 0x885b0) iterates the FTAB and
+ * for each entry:
+ *   - ACTIVE (bit 0):      tail-call calc_func+0x0c (noop for L16/dsp_sko)
+ *   - INACTIVE (bits 0-4 = 0): tail-call calc_func+0x08 (noop accumulator)
+ *   - PENDING (bits 1-4):  call calc_func+0x08, post-calc, set cw
+ *
+ * for L16, all calc functions are effectively no-ops. the only real work is:
+ *   1. clearing pending control words per protocol: *cw = (val & 6) ? 1 : 0
+ *   2. decoder ack: when elem[21]+8 has bit 0 set, send type=1 ring buffer
+ *      message and clear element+8 to 0
  */
 static void ftab_dispatch(struct bgsc_ctx *ctx)
 {
 	ctx->frame_tick++;
 
-	/*
-	 * stock dispatch (dfl_process_flow_asm) processes ALL entries:
-	 *
-	 *   val & 1 (ACTIVE):     call calc_func+0x0c (no-op), continue
-	 *   (val & 0x1f) == 0:    call calc_func+0x08 (signal processing), continue
-	 *   bits 1-4 set:         call calc_func+0x08, post-calc, set cw
-	 *
-	 * critically: val==0 entries ARE processed! the +0x08 function reads
-	 * element+8 and accumulates (val << 4) across all entries. this
-	 * accumulation produces a frame counter/pointer that the CSS uses.
-	 *
-	 * the dispatch uses tail calls (bx, not blx) with LR preset to
-	 * loop top, so it iterates through ALL entries before returning.
-	 */
+	/* periodic state dump — every ~30 seconds (6000 * 5ms) */
+	if ((ctx->frame_tick % 6000) == 0) {
+		fprintf(stderr, "bgsc: === state dump tick %u ===\n",
+		        ctx->frame_tick);
 
-	uint32_t accumulator = 0;
+		/* ring buffer health: is the CSS reading our messages? */
+		uint32_t rb_write = shm_read32(ctx->shm,
+			ctx->rb.hdr_off + 0x08);
+		uint32_t rb_read = shm_read32(ctx->shm,
+			ctx->rb.hdr_off + 0x0c);
+		fprintf(stderr, "  ringbuf: write=0x%x read=0x%x %s\n",
+		        rb_write, rb_read,
+		        (rb_write == rb_read) ? "(caught up)" : "(LAGGING)");
 
-	for (int i = 0; i < ctx->num_control_words; i++) {
-		volatile uint32_t *cw = ctx->control_words[i];
-		if (!cw)
-			continue;
-
-		uint32_t val = *cw;
-
-		/* skip large values (data, not control words) */
-		if (val > 0x3ff && val != 0)
-			continue;
-
-		if (val > 1) {
-			/* bits 1-4: activation (0x14 from SwitchInstance, etc.)
-			 * transition and send completion event */
-			uint32_t new_val = (val & 6) ? 1 : 0;
-			*cw = new_val;
-
-			/* set elem+4 = 1 only if it's currently 0.
-			 * elem[6] and elem[21] need +4 = 1 (status flag).
-			 * elem[22] has a signal block POINTER at +4 that
-			 * we must not overwrite. checking for 0 protects
-			 * against corrupting pre-existing pointer values. */
-			if (*(cw + 1) == 0) {
-				*(cw + 1) = 1;
-			}
-
-			/* pre-set buffer ready flag for encoder channels.
-			 * real buffer pointers are shm addresses (0xb6xxxxxx),
-			 * not small values like 0x000200a2. */
-			uint32_t buf_addr = *(cw + 5);
-			if (buf_addr > 0xb0000000) {
-				*(cw + 4) = 0x00010001;
-			}
-			__sync_synchronize();
-			usleep(1000);
-
-			/* send type=0 completion event */
-			uintptr_t cw_vaddr = (uintptr_t)cw;
-			uint32_t inst_addr = (uint32_t)(cw_vaddr + 4);
-			if (ctx->rb_write_off + 8 >= ctx->rb_data_end)
-				ctx->rb_write_off = ctx->rb_data_off;
-			shm_write32(ctx->shm, ctx->rb_write_off, inst_addr);
-			ctx->rb_write_off += 4;
-			shm_write32(ctx->shm, ctx->rb_write_off, 0);
-			ctx->rb_write_off += 4;
-			uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
-			shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
-		}
-		else if (val == 1) {
-			/* ACTIVE: stock dispatch calls no-op calc and continues.
-			 * leave control word at 1. */
-
-			/* also do the signal processing accumulation
-			 * (same as val==0 path — read element+8, accumulate) */
-			uint32_t elem8 = *(cw + 2); /* element+8 */
-			accumulator += elem8 << 4;
-
-			/* manage buffer ready flag */
-			volatile uint16_t *ready = (volatile uint16_t *)(cw + 4);
-			uint16_t flag = *ready;
-			if (flag == 4) {
-				*ready = 1;
-				__sync_synchronize();
+		/* dump key elements from group 0 */
+		if (ctx->num_groups > 0) {
+			struct elem_group *g0 = &ctx->groups[0];
+			fprintf(stderr, "  group0 has %d elems\n",
+			        g0->num_elems);
+			for (int ei = 0; ei < g0->num_elems; ei++) {
+				volatile uint32_t *e = g0->elems[ei];
+				if (!e) continue;
+				uint32_t cw = e[0];
+				/* only dump active or interesting elements */
+				if (cw == 0 && ei != 0 && ei != 6 &&
+				    ei != 21 && ei != 22)
+					continue;
+				uint32_t off = (uint32_t)(
+					(uintptr_t)e - (uintptr_t)ctx->shm);
+				fprintf(stderr, "  e[%d] shm+0x%x:"
+				        " cw=%u +4=0x%x +8=0x%x"
+				        " +c=0x%x +10=0x%x\n",
+				        ei, off, cw,
+				        e[1], e[2], e[3], e[4]);
 			}
 		}
-		else { /* val == 0 */
-			/* stock dispatch calls calc_func+0x08 (main processing)
-			 * which reads element+8 and accumulates across entries.
-			 * this is the signal block pointer accumulation that
-			 * tells the CSS framework where audio data is. */
-			uint32_t elem8 = *(cw + 2); /* element+8 */
-			accumulator += elem8 << 4;
-		}
+		fprintf(stderr, "bgsc: === end dump ===\n");
 	}
 
-	(void)accumulator;
+	for (int g = 0; g < ctx->num_groups; g++) {
+		struct elem_group *grp = &ctx->groups[g];
 
-	/* send periodic type=3 event for the DECODER element.
-	 *
-	 * from observing stock app_dsp: it sends [inst_addr, 0x6001, 0]
-	 * where inst_addr = decoder_element_address + 4, every ~10ms.
-	 * the decoder callback in p_auc_CB_handler (0x6000 branch)
-	 * triggers the CSS to produce the next encoder frame.
-	 *
-	 * elem[21] is the decoder for SPVOIPNDA unit 0 (first group).
-	 * message format: type=3, 1 param = 0. */
-	if (ctx->num_control_words > 21 && (ctx->frame_tick & 1) == 0) {
-		volatile uint32_t *dec_cw = ctx->control_words[21];
-		if (dec_cw && *dec_cw == 1) {
-			uintptr_t dec_vaddr = (uintptr_t)dec_cw;
-			uint32_t inst_addr = (uint32_t)(dec_vaddr + 4);
+		/* process all control words in this group */
+		for (int i = 0; i < grp->num_elems; i++) {
+			volatile uint32_t *cw = grp->elems[i];
+			if (!cw)
+				continue;
 
-			if (ctx->rb_write_off + 12 >= ctx->rb_data_end)
-				ctx->rb_write_off = ctx->rb_data_off;
-			shm_write32(ctx->shm, ctx->rb_write_off, inst_addr);
-			ctx->rb_write_off += 4;
-			shm_write32(ctx->shm, ctx->rb_write_off, (3 << 13) | 1); /* type=3, 1 param */
-			ctx->rb_write_off += 4;
-			shm_write32(ctx->shm, ctx->rb_write_off, 0); /* param = 0 */
-			ctx->rb_write_off += 4;
-			uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
-			shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
+			uint32_t val = *cw;
+
+			/* skip pointer-sized values (data fields, not control words) */
+			if (val > 0x3ff && val != 0)
+				continue;
+
+			if (val > 1) {
+				/* PENDING: bits 1-4 set by CSS. */
+				uint32_t new_val = (val & 6) ? 1 : 0;
+				uint32_t shm_off = (uint32_t)(
+					(uintptr_t)cw - (uintptr_t)ctx->shm);
+
+				fprintf(stderr, "bgsc: [%u] g%d e%d "
+				        "shm+0x%x cw=0x%x->0x%x"
+				        " +4=0x%x +8=0x%x +c=0x%x\n",
+				        ctx->frame_tick, g, i,
+				        shm_off, val, new_val,
+				        *(cw+1), *(cw+2), *(cw+3));
+
+				/* encoder init: elem[6] per group.
+				 * replicates FUN_00086f50 in stock app_dsp. */
+				if (i == ELEM_ENCODER) {
+					fprintf(stderr, "bgsc:   -> encoder_init\n");
+					encoder_init(cw);
+				}
+
+				*cw = new_val;
+				__sync_synchronize();
+
+				/* send type=0 completion event.
+				 *
+				 * static analysis says stock dsp_sko doesn't
+				 * send this, but empirically the CSS needs SOME
+				 * ring buffer signal during activation to
+				 * proceed past SETCODEC. the helper trampolines
+				 * have complex stack-dependent behavior that may
+				 * cause additional messages in stock that we
+				 * can't easily replicate. this is the simplest
+				 * message that unblocks the CSS. */
+				uint32_t inst_addr = (uint32_t)(uintptr_t)(cw + 1);
+				ringbuf_write_word(&ctx->rb, inst_addr);
+				ringbuf_write_word(&ctx->rb, 0);
+				ringbuf_commit(&ctx->rb);
+				fprintf(stderr, "bgsc:   -> sent type=0 "
+				        "completion [0x%x, 0]\n", inst_addr);
+
+				/* POST_CALC_2 (startup): when bit 4 is set,
+				 * check element+8 and send ack if needed.
+				 * replicates FUN_00088514/FUN_00088548. */
+				if (val & 0x10) {
+					volatile uint32_t *elem8 = cw + 2;
+					uint32_t val8 = *elem8;
+					if (val8 & 1) {
+						ringbuf_send_decoder_ack(
+							&ctx->rb, elem8);
+						*elem8 = 0;
+						__sync_synchronize();
+						fprintf(stderr, "bgsc:   -> "
+						        "sent type=1 ack\n");
+					}
+				}
+			}
+			else if (val == 1) {
+				/* ACTIVE: log first time per element */
+			}
+			/* INACTIVE (val == 0): nothing to do for L16 */
+		}
+
+		/* decoder handling — elem[21] per group.
+		 *
+		 * two mechanisms:
+		 *
+		 * 1. type=3 "decoder ready" — periodic signal (~10ms) that
+		 *    kicks the CSS into producing frames. stock codec calc
+		 *    functions send this via FUN_0008438c. for L16 (dsp_sko
+		 *    noop), we send it manually since no calc function runs.
+		 *    format: [elem+4_addr, (3<<13)|1, 0]
+		 *
+		 * 2. type=1 "frame ack" — sent when CSS sets elem+8 bit 0
+		 *    to acknowledge frame receipt. replicates FUN_0008857c.
+		 *    format: [elem+8_addr, (1<<13)|0]
+		 */
+		if (grp->num_elems > ELEM_DECODER) {
+			volatile uint32_t *dec = grp->elems[ELEM_DECODER];
+			if (dec && (*dec == 1)) {
+				/* type=3: decoder ready, every ~10ms */
+				if ((ctx->frame_tick & 1) == 0) {
+					uint32_t inst = (uint32_t)
+						(uintptr_t)(dec + 1);
+					ringbuf_write_word(&ctx->rb, inst);
+					ringbuf_write_word(&ctx->rb,
+						(3 << 13) | 1);
+					ringbuf_write_word(&ctx->rb, 0);
+					ringbuf_commit(&ctx->rb);
+				}
+
+				/* type=1: frame ack */
+				volatile uint32_t *elem8 = dec + 2;
+				uint32_t val8 = *elem8;
+				if (val8 & 1) {
+					if (ctx->frame_tick < 200 ||
+					    (ctx->frame_tick & 0xff) == 0)
+						fprintf(stderr, "bgsc: [%u] "
+						        "g%d dec_ack +8=0x%x\n",
+						        ctx->frame_tick,
+						        g, val8);
+					ringbuf_send_decoder_ack(
+						&ctx->rb, elem8);
+					*elem8 = 0;
+					__sync_synchronize();
+				}
+			}
 		}
 	}
 }
@@ -310,20 +432,6 @@ struct thread_args {
 	bgsc_ctx_t *ctx;
 	int level;
 };
-
-static void send_heartbeat(struct bgsc_ctx *ctx)
-{
-	/* heartbeat: [0, (4<<13)|0] — 2 words */
-	if (ctx->rb_write_off + 8 >= ctx->rb_data_end)
-		ctx->rb_write_off = ctx->rb_data_off; /* wrap */
-	shm_write32(ctx->shm, ctx->rb_write_off, 0);
-	ctx->rb_write_off += 4;
-	shm_write32(ctx->shm, ctx->rb_write_off, (4 << 13) | 0);
-	ctx->rb_write_off += 4;
-	/* update write pointer in header */
-	uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
-	shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
-}
 
 static void *bg_thread(void *arg)
 {
@@ -340,13 +448,13 @@ static void *bg_thread(void *arg)
 	while (ctx->running) {
 		ftab_dispatch(ctx);
 
-		/* level 1 sends periodic heartbeat (stock app_dsp does this
-		 * from level 0, but since CSS runs level 0 and we run 1-3,
-		 * we send it from level 1) */
+		/* level 1 sends periodic heartbeat.
+		 * stock does this from level 0 (which the CSS runs internally),
+		 * so we send from level 1 as the lowest ARM-side level. */
 		if (level == 1) {
 			tick_count++;
-			if (tick_count >= 16) { /* every ~80ms (16 * 5ms) */
-				send_heartbeat(ctx);
+			if (tick_count >= 16) { /* every ~80ms */
+				ringbuf_send_tick(&ctx->rb);
 				tick_count = 0;
 			}
 		}
@@ -371,7 +479,6 @@ bgsc_ctx_t *bgsc_init(void *shm_ptr)
 	if (!ctx)
 		return NULL;
 	ctx->shm = shm_ptr;
-
 	ctx->shm_mmap_base = (uintptr_t)shm_ptr;
 
 	/* read shared memory state */
@@ -380,12 +487,12 @@ bgsc_ctx_t *bgsc_init(void *shm_ptr)
 	fprintf(stderr, "bgsc: shm alloc watermark=0x%x, DSP version=0x%08x\n",
 	        alloc_wm, ver);
 
-	/* write version tag (like app_dsp: shm+0x14 = version) */
+	/* write version tag (stock app_dsp writes shm+0x14 = version) */
 	shm_write32(shm_ptr, SHM_VERSION_TAG, ver);
 
 	/* allocate ring buffer from shared memory pool.
-	 * layout: [header: 0x10] [data: 0x79c]
-	 * header contains USERSPACE VIRTUAL ADDRESSES for CSS MMU translation. */
+	 * layout: [header: 0x10 bytes] [data: 487 x 4 = 0x79c bytes]
+	 * header uses userspace virtual addresses for CSS MMU translation. */
 	uint32_t hdr_off = alloc_wm;
 	uint32_t data_off = alloc_wm + RINGBUF_HDR_SIZE;
 	uint32_t data_end_off = data_off + RINGBUF_ENTRIES * 4;
@@ -394,56 +501,66 @@ bgsc_ctx_t *bgsc_init(void *shm_ptr)
 	shm_write32(shm_ptr, SHM_CODEC_STATE, data_off);
 	memset((char *)shm_ptr + data_off, 0, RINGBUF_ENTRIES * 4);
 
-	uintptr_t data_vaddr = (uintptr_t)shm_ptr + data_off;
-	uintptr_t data_end_vaddr = (uintptr_t)shm_ptr + data_end_off;
-	shm_write32(shm_ptr, hdr_off + 0x00, (uint32_t)data_vaddr);
-	shm_write32(shm_ptr, hdr_off + 0x04, (uint32_t)data_end_vaddr);
-	shm_write32(shm_ptr, hdr_off + 0x08, (uint32_t)data_vaddr);
-	shm_write32(shm_ptr, hdr_off + 0x0c, (uint32_t)data_vaddr);
-
+	ringbuf_init(&ctx->rb, shm_ptr, hdr_off, data_off, RINGBUF_ENTRIES);
 	shm_write32(shm_ptr, SHM_ALLOC_WM, data_end_off);
 
-	ctx->rb_hdr_off = hdr_off;
-	ctx->rb_data_off = data_off;
-	ctx->rb_data_end = data_end_off;
-	ctx->rb_write_off = data_off;
-
-	fprintf(stderr, "bgsc: ring buffer at shm+0x%x (vaddr=0x%x)\n",
-	        hdr_off, (uint32_t)data_vaddr);
+	fprintf(stderr, "bgsc: ring buffer at shm+0x%x\n", hdr_off);
 
 	/* read element descriptor table at shm+0xb854.
-	 * the CSS creates 368 DSP element descriptors during DUA init.
-	 * each table entry is a userspace virtual address pointing to a
-	 * descriptor in shared memory. the first word of each descriptor
-	 * is the control word we need to monitor. */
-	ctx->num_control_words = 0;
-	fprintf(stderr, "bgsc: shm mmap base = 0x%08x\n",
-	        (uint32_t)ctx->shm_mmap_base);
+	 *
+	 * the CSS creates element descriptors during DUA init and stores
+	 * pointers to them here. each pointer is a userspace virtual address.
+	 * we organize them into groups of ELEMS_PER_GROUP for dispatch. */
+	ctx->num_groups = 0;
+	int elem_idx = 0;
+	struct elem_group *grp = NULL;
 
 	for (int i = 0; i < ELEM_TABLE_COUNT; i++) {
 		uint32_t ptr = shm_read32(shm_ptr, ELEM_TABLE_OFF + i * 4);
 		if (ptr == 0)
 			break;
-		/* convert userspace vaddr to local pointer */
+
 		uintptr_t elem_vaddr = (uintptr_t)ptr;
 		uintptr_t shm_start = ctx->shm_mmap_base;
 		if (elem_vaddr < shm_start || elem_vaddr >= shm_start + 0x100000) {
-			if (i < 5)
-				fprintf(stderr, "bgsc: elem[%d] ptr=0x%08x OUT OF RANGE (shm=0x%08x)\n",
-				        i, ptr, (uint32_t)shm_start);
+			fprintf(stderr, "bgsc: elem[%d] ptr=0x%08x OUT OF RANGE\n",
+			        i, ptr);
 			continue;
 		}
+
+		/* start a new group every ELEMS_PER_GROUP entries */
+		if (elem_idx % ELEMS_PER_GROUP == 0) {
+			if (ctx->num_groups >= MAX_GROUPS)
+				break;
+			grp = &ctx->groups[ctx->num_groups++];
+			grp->num_elems = 0;
+		}
+
 		uint32_t elem_off = (uint32_t)(elem_vaddr - shm_start);
-		ctx->control_words[ctx->num_control_words] =
+		grp->elems[grp->num_elems] =
 			(volatile uint32_t *)((char *)shm_ptr + elem_off);
-		if (i < 5)
-			fprintf(stderr, "bgsc: elem[%d] ptr=0x%08x -> shm+0x%05x (cw=0x%08x)\n",
-			        i, ptr, elem_off,
-			        *(volatile uint32_t *)((char *)shm_ptr + elem_off));
-		ctx->num_control_words++;
+		grp->num_elems++;
+		elem_idx++;
 	}
-	fprintf(stderr, "bgsc: read %d control words from element table\n",
-	        ctx->num_control_words);
+
+	fprintf(stderr, "bgsc: %d elements in %d groups",
+	        elem_idx, ctx->num_groups);
+	if (ctx->num_groups > 0)
+		fprintf(stderr, " (%d elems/group)\n",
+		        ctx->groups[0].num_elems);
+	else
+		fprintf(stderr, "\n");
+
+	/* log first group's decoder element for debugging */
+	if (ctx->num_groups > 0 && ctx->groups[0].num_elems > ELEM_DECODER) {
+		volatile uint32_t *dec = ctx->groups[0].elems[ELEM_DECODER];
+		if (dec) {
+			uint32_t off = (uint32_t)((uintptr_t)dec - (uintptr_t)shm_ptr);
+			fprintf(stderr, "bgsc: group[0] decoder at shm+0x%x"
+			        " (cw=0x%x, +8=0x%x)\n",
+			        off, dec[0], dec[2]);
+		}
+	}
 
 	return ctx;
 }
@@ -455,20 +572,12 @@ int bgsc_start(bgsc_ctx_t *ctx)
 
 	ctx->running = 1;
 
-	/* send "level ready" messages for all 4 levels */
+	/* send "level ready" messages for all 4 levels (0-3).
+	 * stock app_dsp sends these after the BG level state machine
+	 * completes its 2→3→4→5→0x200→1 transition. we send them
+	 * immediately since we start directly in IDLE state. */
 	for (int i = 0; i < 4; i++) {
-		/* write message: [0, (1<<13)|1, level] */
-		shm_write32(ctx->shm, ctx->rb_write_off, 0);
-		ctx->rb_write_off += 4;
-		shm_write32(ctx->shm, ctx->rb_write_off, (1 << 13) | 1);
-		ctx->rb_write_off += 4;
-		shm_write32(ctx->shm, ctx->rb_write_off, (uint32_t)i);
-		ctx->rb_write_off += 4;
-
-		/* update write pointer in header (as userspace vaddr) */
-		uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
-		shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
-
+		ringbuf_send_level_ready(&ctx->rb, i);
 		fprintf(stderr, "bgsc: sent level %d ready\n", i);
 	}
 
@@ -489,11 +598,13 @@ int bgsc_start(bgsc_ctx_t *ctx)
 
 		int ret = pthread_create(&ctx->threads[i], &attr, bg_thread, ta);
 		if (ret != 0) {
+			/* retry without SCHED_FIFO if not running as root */
 			pthread_attr_init(&attr);
 			ret = pthread_create(&ctx->threads[i], &attr, bg_thread, ta);
 			if (ret != 0) {
 				free(ta);
-				fprintf(stderr, "bgsc: failed to create level %d thread\n", i + 1);
+				fprintf(stderr, "bgsc: failed to create level %d thread\n",
+				        i + 1);
 				ctx->running = 0;
 				return -1;
 			}
