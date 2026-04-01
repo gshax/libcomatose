@@ -9,6 +9,8 @@
  * usage:
  *   css_shell                    # interactive mode
  *   css_shell -c "tdm stats 0"  # execute single command, print output, exit
+ *   css_shell -i "text set 1 32 1"  # execute command(s), then go interactive
+ *                                    # (multiple -i flags allowed)
  */
 
 #include <comatose/coma.h>
@@ -160,10 +162,15 @@ static void command_mode(coma_conn_t *conn, const char *cmd)
 int main(int argc, char *argv[])
 {
 	const char *cmd = NULL;
+	const char *init_cmds[16];
+	int num_init = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
 			cmd = argv[++i];
+		} else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+			if (num_init < 16)
+				init_cmds[num_init++] = argv[++i];
 		}
 	}
 
@@ -179,6 +186,16 @@ int main(int argc, char *argv[])
 	if (cmd) {
 		command_mode(conn, cmd);
 	} else {
+		/* send init commands then go interactive */
+		if (num_init > 0) {
+			activate_coma_io(conn);
+			for (int i = 0; i < num_init; i++) {
+				fprintf(stderr, "[init] %s\n", init_cmds[i]);
+				send_input(conn, init_cmds[i], strlen(init_cmds[i]));
+				send_input(conn, "\n", 1);
+				recv_output(conn, 1000);
+			}
+		}
 		interactive_mode(conn);
 	}
 

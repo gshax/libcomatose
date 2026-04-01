@@ -74,6 +74,7 @@ struct bgsc_ctx {
 	/* control word pointers — read from element table at runtime */
 	volatile uint32_t *control_words[ELEM_TABLE_COUNT];
 	int num_control_words;
+	uint32_t frame_tick;            /* dispatch cycle counter */
 
 	pthread_t threads[3];           /* BG levels 1-3 */
 	volatile int running;
@@ -177,6 +178,7 @@ static void ringbuf_send_tick(struct ringbuf *rb)
  */
 static void ftab_dispatch(struct bgsc_ctx *ctx)
 {
+	ctx->frame_tick++;
 	for (int i = 0; i < ctx->num_control_words; i++) {
 		volatile uint32_t *cw = ctx->control_words[i];
 		if (!cw)
@@ -190,41 +192,88 @@ static void ftab_dispatch(struct bgsc_ctx *ctx)
 		if (val > 0x3ff)
 			continue;
 
-		/* process per stock dispatch protocol */
-		uint32_t new_val = (val & 6) ? 1 : 0;
-		*cw = new_val;
-		__sync_synchronize();
+		/* transition activation bits to steady state */
+		if (val > 1) {
+			uint32_t new_val = (val & 6) ? 1 : 0;
+			*cw = new_val;
+			*(cw + 1) = 1;  /* element+4 = status */
 
-		/* for SwitchInstance activations (0x14, 0x12):
-		 * 1. set element+4 status word
-		 * 2. send completion event through ring buffer
-		 *
-		 * the CSS's p_dspa_find_instance resolves the event by
-		 * matching (message_word0 - 4) against ITAB entries.
-		 * ITAB entries point to control words. so we send
-		 * (control_word_vaddr + 4) as the instance address.
-		 *
-		 * the event type must be 0 (header bits 13-15 = 0) so that
-		 * p_auc_CB_handler takes the state 3→4 transition path. */
-		if (val & 0x16) {
-			*(cw + 1) = 1;
+			/* pre-set buffer ready flag for encoder channels.
+			 * the CSS calls SendBufferPayload immediately after
+			 * session start — if the flag isn't 1 by then, it
+			 * fails with -353 and panics.
+			 *
+			 * the flag is at cw + buffer_index*2 + 0x10 (uint16).
+			 * we don't know the buffer_index, so set BOTH possible
+			 * offsets (+0x10 and +0x12) to 1. also set the whole
+			 * uint32 at cw+0x10 to 0x00010001 for good measure. */
+			uint32_t buf_addr = *(cw + 5); /* cw+0x14 = buffer ptr */
+			if (buf_addr > 0x10000) {
+				*(cw + 4) = 0x00010001; /* both uint16 slots = 1 */
+			}
+			__sync_synchronize();
 
-			/* send completion event: [cw_vaddr + 4, 0|0] */
+			/* small delay to ensure flag write propagates before
+			 * the completion event triggers CSS processing */
+			usleep(1000);
+
+			/* send type=0 completion event (triggers state 3→4) */
 			uintptr_t cw_vaddr = (uintptr_t)cw;
-			uint32_t instance_addr = (uint32_t)(cw_vaddr + 4);
+			uint32_t inst_addr = (uint32_t)(cw_vaddr + 4);
 
 			if (ctx->rb_write_off + 8 >= ctx->rb_data_end)
 				ctx->rb_write_off = ctx->rb_data_off;
-			shm_write32(ctx->shm, ctx->rb_write_off, instance_addr);
+			shm_write32(ctx->shm, ctx->rb_write_off, inst_addr);
 			ctx->rb_write_off += 4;
-			shm_write32(ctx->shm, ctx->rb_write_off, 0); /* type=0, 0 params */
+			shm_write32(ctx->shm, ctx->rb_write_off, 0); /* type=0 */
 			ctx->rb_write_off += 4;
 			uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
 			shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
+		}
+		/* for active elements: manage encoder buffer + frame events.
+		 *
+		 * buffer ready flag protocol (at cw+0x10, uint16):
+		 *   0 = not ready
+		 *   1 = buffer free, CSS may write
+		 *   4 = CSS wrote a frame
+		 *
+		 * type=3 (0x6000) events trigger CSS to process state 4
+		 * channels and call SendBufferPayload. we only send these
+		 * for elements that have an audio buffer (cw+0x14 != 0),
+		 * which identifies them as encoder/decoder channels. */
+		else if (val == 1) {
+			/* manage ready flag */
+			volatile uint16_t *ready = (volatile uint16_t *)(cw + 4);
+			uint16_t flag = *ready;
 
-			uint32_t off = (uint32_t)((char *)cw - (char *)ctx->shm);
-			fprintf(stderr, "bgsc: dispatch[%d] shm+0x%05x: 0x%x → sent completion (inst_addr=0x%x)\n",
-			        i, off, val, instance_addr);
+			if (flag == 0) {
+				*ready = 1;
+				__sync_synchronize();
+			} else if (flag == 4) {
+				*ready = 1;
+				__sync_synchronize();
+			}
+
+			/* send periodic type=3 (0x6000) events for encoder channels.
+			 * these trigger the CSS to call SendBufferPayload, which
+			 * writes audio to the DSP buffer. the ready flag at cw+0x10
+			 * was pre-set to 1 during initial activation so
+			 * SendBufferPayload won't fail with -353.
+			 * only for elements with a buffer pointer at cw+0x14. */
+			uint32_t buf_addr = *(cw + 5);
+			if (buf_addr > 0x10000 && (ctx->frame_tick & 3) == 0) {
+				uintptr_t cw_vaddr = (uintptr_t)cw;
+				uint32_t inst_addr = (uint32_t)(cw_vaddr + 4);
+
+				if (ctx->rb_write_off + 8 >= ctx->rb_data_end)
+					ctx->rb_write_off = ctx->rb_data_off;
+				shm_write32(ctx->shm, ctx->rb_write_off, inst_addr);
+				ctx->rb_write_off += 4;
+				shm_write32(ctx->shm, ctx->rb_write_off, (3 << 13) | 0);
+				ctx->rb_write_off += 4;
+				uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
+				shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
+			}
 		}
 	}
 }
