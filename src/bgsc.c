@@ -29,6 +29,7 @@
  */
 
 #include <comatose/bgsc.h>
+#include <comatose/bgsc_defs.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -177,70 +178,154 @@ struct bgsc_ctx {
 };
 
 /*
- * encoder element initialization — replicates FUN_00086f50 in stock app_dsp.
+ * ARM module registration tables.
  *
- * when the CSS activates an encoder element (bits 1-4 set with bit 4 for
- * POST_CALC_2), the stock dispatch calls the encoder's pending calc which
- * initializes ~30 fields in the encoder's element descriptor in shared memory.
- * the CSS reads these fields to confirm the encoder is ready.
+ * the CSS stores these addresses as opaque tokens in element descriptors
+ * and passes them back during dispatch. stock app_dsp uses real function
+ * pointers into its BSS (0x000cxxxx) and codec tables (0x0011aaxx).
  *
- * the values below are constants extracted from FUN_00086f50's decompilation.
- * param cw: pointer to the encoder element's control word in shared memory.
+ * for L16, the dispatch never dereferences these. we use static tables
+ * so the addresses are valid and stable, and distinctive for debugging.
+ *
+ * stock address categories:
+ *   0x000c3ff8  → BG level processing struct (one global)
+ *   0x000c4xxx  → per-group processing config (varies per group)
+ *   0x0011aaxx  → global codec function tables (WAD/WAE/G1E/G1D etc.)
+ *   0x0012xxxx  → module-specific data
  */
-static void encoder_init(volatile uint32_t *cw)
+static uint32_t arm_bg_level_stub = 0xC0DE0100;
+
+/* per-group config stubs — stock has different 0x000c4xxx addrs per group.
+ * we provide one stub per group since the CSS might use them as indices. */
+static uint32_t arm_group_config[MAX_GROUPS][4]; /* zeroed, used as opaque tokens */
+
+/* codec function table stubs — stock has entries at 0x0011aaxx.
+ * the CSS stores and passes these back during dispatch. for L16 noop. */
+static uint32_t arm_codec_table[8]; /* one slot per unique function entry */
+
+/* module-specific data stub — stock has 0x0012xxxx entries in elem[1] */
+static uint32_t arm_module_data[4];
+
+/*
+ * module_startup — populate element descriptors with codec registration data.
+ *
+ * replaces stock app_dsp's dfl_module_startup (FUN_00075810, 36KB, 21 callees).
+ * writes the common header fields and codec-specific configuration that the CSS
+ * reads via its (instance, offset) parameter system to configure audio routing.
+ *
+ * stock writes ~2137 lines worth of data across all element descriptors. we
+ * start with the minimum viable set (common header + codec config) and add
+ * more fields iteratively based on what the CSS requires.
+ */
+/*
+ * write a uint32 to an element descriptor at a byte offset,
+ * but only if the current value is zero (don't overwrite CSS data).
+ */
+static inline void elem_set_if_zero(volatile uint32_t *elem,
+                                    unsigned byte_off, uint32_t val)
 {
-	volatile uint16_t *h = (volatile uint16_t *)cw;
-	/* FUN_00086f50 field writes (offsets from cw, as uint16): */
-	h[2]  = 1;       /* +4:  active flag */
-	h[3]  = 1;       /* +6:  active flag */
-	h[4]  = 0;       /* +8:  clear */
-	h[5]  = 0x10;    /* +0xa: config */
-	h[7]  = 0;       /* +0xe */
-	h[8]  = 0;       /* +0x10 */
-	h[9]  = 0;       /* +0x12 */
-	h[10] = 0;       /* +0x14 */
+	volatile uint32_t *p = (volatile uint32_t *)((char *)elem + byte_off);
+	if (*p == 0)
+		*p = val;
+}
 
-	uint16_t s = h[2]; /* = 1 */
-	h[24] = 6000;    /* +0x30: sample rate related */
-	h[25] = 0x0b;    /* +0x32 */
-	h[26] = 0x19;    /* +0x34 */
-	h[27] = 10;      /* +0x36 */
-	h[28] = 0x21;    /* +0x38 */
-	h[31] = 0xf0;    /* +0x3e */
-	h[15] = 0;       /* +0x1e */
-	h[16] = 0;       /* +0x20 */
-	h[17] = 0;       /* +0x22 */
-	h[18] = 0;       /* +0x24 */
-	h[19] = 0;       /* +0x26 */
-	h[20] = 0;       /* +0x28 */
-	h[21] = 0;       /* +0x2a */
-	h[22] = 5000;    /* +0x2c */
-	h[23] = 5000;    /* +0x2e */
-	h[29] = 0;       /* +0x3a */
-	h[30] = 0;       /* +0x3c */
+static void module_startup(struct bgsc_ctx *ctx)
+{
+	uint32_t bg_addr = (uint32_t)(uintptr_t)&arm_bg_level_stub;
+	uint32_t ct_base = (uint32_t)(uintptr_t)&arm_codec_table[0];
+	uint32_t md_base = (uint32_t)(uintptr_t)&arm_module_data[0];
 
-	/* uint32 writes */
-	volatile uint32_t *w = (volatile uint32_t *)cw;
-	w[16] = 0;       /* +0x40 */
-	w[17] = 0;       /* +0x44 */
-	w[18] = 0;       /* +0x48 */
-	w[40] = 0;       /* +0xa0 */
-	w[41] = 0;       /* +0xa4 */
-	w[42] = 0;       /* +0xa8 */
+	for (int g = 0; g < ctx->num_groups; g++) {
+		struct elem_group *grp = &ctx->groups[g];
+		uint32_t gc_base = (uint32_t)(uintptr_t)&arm_group_config[g][0];
 
-	h[11] = 0x7fa1;  /* +0x16: threshold */
-	h[12] = s << 4;  /* +0x18 */
-	h[13] = s << 7;  /* +0x1a */
-	h[14] = s * 0x1e;/* +0x1c */
+		/* elem[0]: codec config — mark codecs as registered */
+		if (grp->num_elems > DFL_ELEM_CODEC && grp->elems[DFL_ELEM_CODEC]) {
+			struct dfl_elem_codec *codec =
+				(struct dfl_elem_codec *)grp->elems[DFL_ELEM_CODEC];
+			codec->hdr.config = DFL_CODEC_REGISTERED;
+		}
 
-	/* clear 0x54 bytes at +0x4c */
-	memset((void *)(cw + 0x4c/4), 0, 0x54);
+		/* elem[1]: routing helper — has a unique layout (no common hdr).
+		 * stock has ARM addrs at +0x14, +0x1c, +0x40. */
+		if (grp->num_elems > 1 && grp->elems[1]) {
+			volatile uint32_t *e1 = grp->elems[1];
+			elem_set_if_zero(e1, 0x14, md_base);      /* module data */
+			elem_set_if_zero(e1, 0x1c, bg_addr);       /* BG level struct */
+			elem_set_if_zero(e1, 0x40, md_base + 4);   /* module data */
+		}
 
-	h[54] = 0;       /* +0x6c */
-	h[61] = h[13];   /* +0x7a = value from +0x1a */
-	h[62] = h[14];   /* +0x7c = value from +0x1c */
+		/* elements 2-21 (except buffer and next-codec): common header */
+		for (int i = 2; i < grp->num_elems; i++) {
+			if (i == DFL_ELEM_BUFFER || i == DFL_ELEM_NEXT_CODEC)
+				continue;
+			volatile uint32_t *elem = grp->elems[i];
+			if (!elem) continue;
+
+			struct dfl_elem_hdr *hdr = (struct dfl_elem_hdr *)elem;
+
+			if (hdr->group_type == 0)
+				hdr->group_type = (i < 10)
+					? DFL_GROUP_TYPE_LEVEL0
+					: DFL_GROUP_TYPE_LEVEL1;
+			if (hdr->buf_config == 0)
+				hdr->buf_config = 0x100;
+			if (hdr->arm_module == 0)
+				hdr->arm_module = bg_addr;
+		}
+
+		/* elem[6] (encoder): frame config + codec function table.
+		 * stock has 15 ARM addrs at +0x074 through +0x0e4. these are
+		 * per-group config addrs (0x000c4xxx) and codec table addrs
+		 * (0x0011aaxx). for L16 they're opaque tokens, never called. */
+		if (grp->num_elems > DFL_ELEM_ENCODER && grp->elems[DFL_ELEM_ENCODER]) {
+			volatile uint32_t *enc = grp->elems[DFL_ELEM_ENCODER];
+			elem_set_if_zero(enc, 0x28, DFL_FRAME_CONFIG_DEFAULT);
+			/* codec function table slots (stock pattern from shm dump) */
+			elem_set_if_zero(enc, 0x074, gc_base);     /* per-group */
+			elem_set_if_zero(enc, 0x078, ct_base);     /* codec table */
+			elem_set_if_zero(enc, 0x07c, ct_base + 4); /* codec table */
+			elem_set_if_zero(enc, 0x080, ct_base + 8); /* codec table */
+			elem_set_if_zero(enc, 0x084, ct_base);     /* codec table */
+			elem_set_if_zero(enc, 0x088, ct_base + 12);/* codec table */
+			elem_set_if_zero(enc, 0x08c, gc_base);     /* per-group */
+			elem_set_if_zero(enc, 0x0b4, gc_base + 4); /* per-group */
+			elem_set_if_zero(enc, 0x0bc, ct_base);     /* codec table */
+			elem_set_if_zero(enc, 0x0c0, gc_base);     /* per-group */
+			elem_set_if_zero(enc, 0x0c4, gc_base + 4); /* per-group */
+			elem_set_if_zero(enc, 0x0cc, ct_base);     /* codec table */
+			elem_set_if_zero(enc, 0x0d0, gc_base);     /* per-group */
+			elem_set_if_zero(enc, 0x0d4, gc_base + 4); /* per-group */
+			elem_set_if_zero(enc, 0x0e0, ct_base);     /* codec table */
+			elem_set_if_zero(enc, 0x0e4, gc_base);     /* per-group */
+		}
+
+		/* elem[2] (codec module): similar function table at +0xa4-0xfc */
+		if (grp->num_elems > 2 && grp->elems[2]) {
+			volatile uint32_t *e2 = grp->elems[2];
+			elem_set_if_zero(e2, 0x0a4, gc_base);
+			elem_set_if_zero(e2, 0x0a8, ct_base);
+			elem_set_if_zero(e2, 0x0ac, ct_base + 4);
+			elem_set_if_zero(e2, 0x0b0, ct_base + 8);
+			elem_set_if_zero(e2, 0x0b4, ct_base);
+			elem_set_if_zero(e2, 0x0b8, ct_base + 12);
+			elem_set_if_zero(e2, 0x0bc, gc_base);
+			elem_set_if_zero(e2, 0x0e4, gc_base + 4);
+			elem_set_if_zero(e2, 0x0ec, ct_base);
+			elem_set_if_zero(e2, 0x0f0, gc_base);
+			elem_set_if_zero(e2, 0x0f4, gc_base + 4);
+			elem_set_if_zero(e2, 0x0fc, ct_base);
+		}
+
+		/* elem[21] (decoder): frame config */
+		if (grp->num_elems > DFL_ELEM_DECODER && grp->elems[DFL_ELEM_DECODER]) {
+			volatile uint32_t *dec = grp->elems[DFL_ELEM_DECODER];
+			elem_set_if_zero(dec, 0x28, DFL_FRAME_CONFIG_DEFAULT);
+		}
+	}
 
 	__sync_synchronize();
+	fprintf(stderr, "bgsc: module_startup done (%d groups)\n", ctx->num_groups);
 }
 
 /*
@@ -328,11 +413,33 @@ static void ftab_dispatch(struct bgsc_ctx *ctx)
 				        shm_off, val, new_val,
 				        *(cw+1), *(cw+2), *(cw+3));
 
-				/* encoder init: elem[6] per group.
-				 * replicates FUN_00086f50 in stock app_dsp. */
-				if (i == ELEM_ENCODER) {
-					fprintf(stderr, "bgsc:   -> encoder_init\n");
-					encoder_init(cw);
+				/* buffer element (elem[22]): dual-buffer setup.
+				 *
+				 * in stock, the CSS differentiates +4 and +8 during
+				 * SETCODEC activation (0x12): +4 shifts by 0x140
+				 * from +8 to create separate input/output buffers.
+				 * this only happens for the 0x12 activation (where
+				 * the element becomes ACTIVE), not the initial 0x10.
+				 *
+				 * since the CSS isn't doing this for us, manually
+				 * apply the 0x140 offset to +4. */
+				if (i == DFL_ELEM_BUFFER && new_val == 1) {
+					/* only during 0x12 (becomes active) */
+					struct dfl_elem_buffer *buf =
+						(struct dfl_elem_buffer *)cw;
+					uint32_t base = buf->buf_ptr_b; /* +8: base ptr */
+					if (base > 0xb0000000) {
+						buf->buf_ptr_a = base + 0x140;
+						buf->buf_ptr_c = base + 0x144;
+						__sync_synchronize();
+						fprintf(stderr,
+						        "bgsc:   -> buf dual: "
+						        "+4=0x%x +8=0x%x "
+						        "(delta=0x%x)\n",
+						        buf->buf_ptr_a,
+						        buf->buf_ptr_b,
+						        buf->buf_ptr_a - base);
+					}
 				}
 
 				*cw = new_val;
@@ -515,12 +622,25 @@ bgsc_ctx_t *bgsc_init(void *shm_ptr)
 	int elem_idx = 0;
 	struct elem_group *grp = NULL;
 
+	/* detect mmap base used when element table was created.
+	 * if we mmapped at a different address (e.g. --bgsc-only after
+	 * killing stock app_dsp), rebase the pointers. */
+	uint32_t first_ptr = shm_read32(shm_ptr, ELEM_TABLE_OFF);
+	intptr_t rebase = 0;
+	if (first_ptr != 0) {
+		uintptr_t orig_base = (uintptr_t)first_ptr - 0x30;
+		rebase = (intptr_t)ctx->shm_mmap_base - (intptr_t)orig_base;
+		if (rebase != 0)
+			fprintf(stderr, "bgsc: rebasing elem ptrs by %+d\n",
+			        (int)rebase);
+	}
+
 	for (int i = 0; i < ELEM_TABLE_COUNT; i++) {
 		uint32_t ptr = shm_read32(shm_ptr, ELEM_TABLE_OFF + i * 4);
 		if (ptr == 0)
 			break;
 
-		uintptr_t elem_vaddr = (uintptr_t)ptr;
+		uintptr_t elem_vaddr = (uintptr_t)ptr + rebase;
 		uintptr_t shm_start = ctx->shm_mmap_base;
 		if (elem_vaddr < shm_start || elem_vaddr >= shm_start + 0x100000) {
 			fprintf(stderr, "bgsc: elem[%d] ptr=0x%08x OUT OF RANGE\n",
@@ -550,6 +670,9 @@ bgsc_ctx_t *bgsc_init(void *shm_ptr)
 		        ctx->groups[0].num_elems);
 	else
 		fprintf(stderr, "\n");
+
+	/* populate element descriptors with codec registration data */
+	module_startup(ctx);
 
 	/* log first group's decoder element for debugging */
 	if (ctx->num_groups > 0 && ctx->groups[0].num_elems > ELEM_DECODER) {

@@ -21,6 +21,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 
 static volatile int running = 1;
 
@@ -51,6 +53,7 @@ int main(int argc, char *argv[])
 	int no_dua_init = 0;
 	int no_tdm_grant = 0;
 	int no_bgsc = 0;
+	int bgsc_only = 0;
 	int fxs_override = -1;
 
 	for (int i = 1; i < argc; i++) {
@@ -62,6 +65,8 @@ int main(int argc, char *argv[])
 			no_tdm_grant = 1;
 		else if (strcmp(argv[i], "--no-bgsc") == 0)
 			no_bgsc = 1;
+		else if (strcmp(argv[i], "--bgsc-only") == 0)
+			bgsc_only = 1;
 		else if (strcmp(argv[i], "--fxs-count") == 0 && i + 1 < argc)
 			fxs_override = atoi(argv[++i]);
 		else {
@@ -167,10 +172,23 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "  (skipped — rely on external app_dsp)\n");
 	} else {
 		fprintf(stderr, "\n--- BGSC ---\n");
-		void *shm = no_dua_init ? NULL : dua_shm_ptr(sess);
+		void *shm = NULL;
+		if (bgsc_only) {
+			/* mmap shared memory without DUA init — for use after
+			 * stock app_dsp has already populated the shared memory
+			 * (kill -9 app_dsp, then run with --bgsc-only) */
+			int fd = open("/dev/sharedmem", O_RDWR);
+			if (fd >= 0) {
+				shm = mmap(NULL, 0x100000, PROT_READ | PROT_WRITE,
+				           MAP_SHARED, fd, 0);
+				if (shm == MAP_FAILED) shm = NULL;
+				fprintf(stderr, "  shm mmap: %p (fd=%d)\n", shm, fd);
+			}
+		} else {
+			shm = no_dua_init ? NULL : dua_shm_ptr(sess);
+		}
 		if (!shm) {
-			fprintf(stderr, "  no shared memory pointer (need DUA init for BGSC)\n");
-			fprintf(stderr, "  use --no-bgsc if running with external app_dsp\n");
+			fprintf(stderr, "  no shared memory pointer\n");
 			goto cleanup;
 		}
 		bgsc = bgsc_init(shm);
