@@ -179,101 +179,116 @@ static void ringbuf_send_tick(struct ringbuf *rb)
 static void ftab_dispatch(struct bgsc_ctx *ctx)
 {
 	ctx->frame_tick++;
+
+	/*
+	 * stock dispatch (dfl_process_flow_asm) processes ALL entries:
+	 *
+	 *   val & 1 (ACTIVE):     call calc_func+0x0c (no-op), continue
+	 *   (val & 0x1f) == 0:    call calc_func+0x08 (signal processing), continue
+	 *   bits 1-4 set:         call calc_func+0x08, post-calc, set cw
+	 *
+	 * critically: val==0 entries ARE processed! the +0x08 function reads
+	 * element+8 and accumulates (val << 4) across all entries. this
+	 * accumulation produces a frame counter/pointer that the CSS uses.
+	 *
+	 * the dispatch uses tail calls (bx, not blx) with LR preset to
+	 * loop top, so it iterates through ALL entries before returning.
+	 */
+
+	uint32_t accumulator = 0;
+
 	for (int i = 0; i < ctx->num_control_words; i++) {
 		volatile uint32_t *cw = ctx->control_words[i];
 		if (!cw)
 			continue;
 
 		uint32_t val = *cw;
-		if (val == 0)
+
+		/* skip large values (data, not control words) */
+		if (val > 0x3ff && val != 0)
 			continue;
 
-		/* only process small values that look like control words */
-		if (val > 0x3ff)
-			continue;
-
-		/* transition activation bits to steady state */
 		if (val > 1) {
+			/* bits 1-4: activation (0x14 from SwitchInstance, etc.)
+			 * transition and send completion event */
 			uint32_t new_val = (val & 6) ? 1 : 0;
 			*cw = new_val;
-			*(cw + 1) = 1;  /* element+4 = status */
+			*(cw + 1) = 1;
 
-			/* pre-set buffer ready flag for encoder channels.
-			 * the CSS calls SendBufferPayload immediately after
-			 * session start — if the flag isn't 1 by then, it
-			 * fails with -353 and panics.
-			 *
-			 * the flag is at cw + buffer_index*2 + 0x10 (uint16).
-			 * we don't know the buffer_index, so set BOTH possible
-			 * offsets (+0x10 and +0x12) to 1. also set the whole
-			 * uint32 at cw+0x10 to 0x00010001 for good measure. */
-			uint32_t buf_addr = *(cw + 5); /* cw+0x14 = buffer ptr */
+			/* pre-set buffer ready flag for encoder channels */
+			uint32_t buf_addr = *(cw + 5);
 			if (buf_addr > 0x10000) {
-				*(cw + 4) = 0x00010001; /* both uint16 slots = 1 */
+				*(cw + 4) = 0x00010001;
 			}
 			__sync_synchronize();
-
-			/* small delay to ensure flag write propagates before
-			 * the completion event triggers CSS processing */
 			usleep(1000);
 
-			/* send type=0 completion event (triggers state 3→4) */
+			/* send type=0 completion event */
 			uintptr_t cw_vaddr = (uintptr_t)cw;
 			uint32_t inst_addr = (uint32_t)(cw_vaddr + 4);
-
 			if (ctx->rb_write_off + 8 >= ctx->rb_data_end)
 				ctx->rb_write_off = ctx->rb_data_off;
 			shm_write32(ctx->shm, ctx->rb_write_off, inst_addr);
 			ctx->rb_write_off += 4;
-			shm_write32(ctx->shm, ctx->rb_write_off, 0); /* type=0 */
+			shm_write32(ctx->shm, ctx->rb_write_off, 0);
 			ctx->rb_write_off += 4;
 			uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
 			shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
 		}
-		/* for active elements: manage encoder buffer + frame events.
-		 *
-		 * buffer ready flag protocol (at cw+0x10, uint16):
-		 *   0 = not ready
-		 *   1 = buffer free, CSS may write
-		 *   4 = CSS wrote a frame
-		 *
-		 * type=3 (0x6000) events trigger CSS to process state 4
-		 * channels and call SendBufferPayload. we only send these
-		 * for elements that have an audio buffer (cw+0x14 != 0),
-		 * which identifies them as encoder/decoder channels. */
 		else if (val == 1) {
-			/* manage ready flag */
+			/* ACTIVE: stock dispatch calls no-op calc and continues.
+			 * leave control word at 1. */
+
+			/* also do the signal processing accumulation
+			 * (same as val==0 path — read element+8, accumulate) */
+			uint32_t elem8 = *(cw + 2); /* element+8 */
+			accumulator += elem8 << 4;
+
+			/* manage buffer ready flag */
 			volatile uint16_t *ready = (volatile uint16_t *)(cw + 4);
 			uint16_t flag = *ready;
-
-			if (flag == 0) {
-				*ready = 1;
-				__sync_synchronize();
-			} else if (flag == 4) {
+			if (flag == 4) {
 				*ready = 1;
 				__sync_synchronize();
 			}
+		}
+		else { /* val == 0 */
+			/* stock dispatch calls calc_func+0x08 (main processing)
+			 * which reads element+8 and accumulates across entries.
+			 * this is the signal block pointer accumulation that
+			 * tells the CSS framework where audio data is. */
+			uint32_t elem8 = *(cw + 2); /* element+8 */
+			accumulator += elem8 << 4;
+		}
+	}
 
-			/* send periodic type=3 (0x6000) events for encoder channels.
-			 * these trigger the CSS to call SendBufferPayload, which
-			 * writes audio to the DSP buffer. the ready flag at cw+0x10
-			 * was pre-set to 1 during initial activation so
-			 * SendBufferPayload won't fail with -353.
-			 * only for elements with a buffer pointer at cw+0x14. */
-			uint32_t buf_addr = *(cw + 5);
-			if (buf_addr > 0x10000 && (ctx->frame_tick & 3) == 0) {
-				uintptr_t cw_vaddr = (uintptr_t)cw;
-				uint32_t inst_addr = (uint32_t)(cw_vaddr + 4);
+	(void)accumulator;
 
-				if (ctx->rb_write_off + 8 >= ctx->rb_data_end)
-					ctx->rb_write_off = ctx->rb_data_off;
-				shm_write32(ctx->shm, ctx->rb_write_off, inst_addr);
-				ctx->rb_write_off += 4;
-				shm_write32(ctx->shm, ctx->rb_write_off, (3 << 13) | 0);
-				ctx->rb_write_off += 4;
-				uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
-				shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
-			}
+	/* send periodic type=3 event for the DECODER element.
+	 *
+	 * from observing stock app_dsp: it sends [inst_addr, 0x6001, 0]
+	 * where inst_addr = decoder_element_address + 4, every ~10ms.
+	 * the decoder callback in p_auc_CB_handler (0x6000 branch)
+	 * triggers the CSS to produce the next encoder frame.
+	 *
+	 * elem[21] is the decoder for SPVOIPNDA unit 0 (first group).
+	 * message format: type=3, 1 param = 0. */
+	if (ctx->num_control_words > 21 && (ctx->frame_tick & 1) == 0) {
+		volatile uint32_t *dec_cw = ctx->control_words[21];
+		if (dec_cw && *dec_cw == 1) {
+			uintptr_t dec_vaddr = (uintptr_t)dec_cw;
+			uint32_t inst_addr = (uint32_t)(dec_vaddr + 4);
+
+			if (ctx->rb_write_off + 12 >= ctx->rb_data_end)
+				ctx->rb_write_off = ctx->rb_data_off;
+			shm_write32(ctx->shm, ctx->rb_write_off, inst_addr);
+			ctx->rb_write_off += 4;
+			shm_write32(ctx->shm, ctx->rb_write_off, (3 << 13) | 1); /* type=3, 1 param */
+			ctx->rb_write_off += 4;
+			shm_write32(ctx->shm, ctx->rb_write_off, 0); /* param = 0 */
+			ctx->rb_write_off += 4;
+			uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
+			shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
 		}
 	}
 }
