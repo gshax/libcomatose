@@ -175,8 +175,6 @@ static void ringbuf_send_tick(struct ringbuf *rb)
  *   bit 7 (0x80): ALT_PREPARE
  *   after processing: set to (val & 6) ? 1 : 0
  */
-static int dispatch_log_count = 0;
-
 static void ftab_dispatch(struct bgsc_ctx *ctx)
 {
 	for (int i = 0; i < ctx->num_control_words; i++) {
@@ -192,24 +190,42 @@ static void ftab_dispatch(struct bgsc_ctx *ctx)
 		if (val > 0x3ff)
 			continue;
 
+		/* process per stock dispatch protocol */
 		uint32_t new_val = (val & 6) ? 1 : 0;
-
-		if (dispatch_log_count < 50) {
-			uint32_t off = (uint32_t)((char *)cw - (char *)ctx->shm);
-			fprintf(stderr, "bgsc: dispatch[%d] shm+0x%05x: 0x%x -> 0x%x\n",
-			        i, off, val, new_val);
-			dispatch_log_count++;
-		}
-
-		/* acknowledge: clear activation bits per dispatch protocol.
-		 * also set element+4 (status word) to signal processing done.
-		 * the stock dsp_sko calc function reads and updates this field. */
 		*cw = new_val;
-		if (val & 0x14) {
-			/* SwitchInstance activation (bits 2/4) — update status */
-			*(cw + 1) = 1;
-		}
 		__sync_synchronize();
+
+		/* for SwitchInstance activations (0x14, 0x12):
+		 * 1. set element+4 status word
+		 * 2. send completion event through ring buffer
+		 *
+		 * the CSS's p_dspa_find_instance resolves the event by
+		 * matching (message_word0 - 4) against ITAB entries.
+		 * ITAB entries point to control words. so we send
+		 * (control_word_vaddr + 4) as the instance address.
+		 *
+		 * the event type must be 0 (header bits 13-15 = 0) so that
+		 * p_auc_CB_handler takes the state 3→4 transition path. */
+		if (val & 0x16) {
+			*(cw + 1) = 1;
+
+			/* send completion event: [cw_vaddr + 4, 0|0] */
+			uintptr_t cw_vaddr = (uintptr_t)cw;
+			uint32_t instance_addr = (uint32_t)(cw_vaddr + 4);
+
+			if (ctx->rb_write_off + 8 >= ctx->rb_data_end)
+				ctx->rb_write_off = ctx->rb_data_off;
+			shm_write32(ctx->shm, ctx->rb_write_off, instance_addr);
+			ctx->rb_write_off += 4;
+			shm_write32(ctx->shm, ctx->rb_write_off, 0); /* type=0, 0 params */
+			ctx->rb_write_off += 4;
+			uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
+			shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
+
+			uint32_t off = (uint32_t)((char *)cw - (char *)ctx->shm);
+			fprintf(stderr, "bgsc: dispatch[%d] shm+0x%05x: 0x%x → sent completion (inst_addr=0x%x)\n",
+			        i, off, val, instance_addr);
+		}
 	}
 }
 
@@ -221,6 +237,20 @@ struct thread_args {
 	int level;
 };
 
+static void send_heartbeat(struct bgsc_ctx *ctx)
+{
+	/* heartbeat: [0, (4<<13)|0] — 2 words */
+	if (ctx->rb_write_off + 8 >= ctx->rb_data_end)
+		ctx->rb_write_off = ctx->rb_data_off; /* wrap */
+	shm_write32(ctx->shm, ctx->rb_write_off, 0);
+	ctx->rb_write_off += 4;
+	shm_write32(ctx->shm, ctx->rb_write_off, (4 << 13) | 0);
+	ctx->rb_write_off += 4;
+	/* update write pointer in header */
+	uintptr_t wp_vaddr = (uintptr_t)ctx->shm + ctx->rb_write_off;
+	shm_write32(ctx->shm, ctx->rb_hdr_off + 0x08, (uint32_t)wp_vaddr);
+}
+
 static void *bg_thread(void *arg)
 {
 	struct thread_args *ta = arg;
@@ -229,11 +259,24 @@ static void *bg_thread(void *arg)
 	free(ta);
 
 	struct timespec period = { .tv_sec = 0, .tv_nsec = 5000000 }; /* 5ms */
+	int tick_count = 0;
 
 	fprintf(stderr, "bgsc: level %d thread started\n", level);
 
 	while (ctx->running) {
 		ftab_dispatch(ctx);
+
+		/* level 1 sends periodic heartbeat (stock app_dsp does this
+		 * from level 0, but since CSS runs level 0 and we run 1-3,
+		 * we send it from level 1) */
+		if (level == 1) {
+			tick_count++;
+			if (tick_count >= 16) { /* every ~80ms (16 * 5ms) */
+				send_heartbeat(ctx);
+				tick_count = 0;
+			}
+		}
+
 		nanosleep(&period, NULL);
 	}
 
