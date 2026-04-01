@@ -168,6 +168,25 @@ void dua_full_teardown(dua_session_t *sess,
                        comatose_hw_state_t *state);
 
 /*
+ * CSS event polling
+ *
+ * the CSS sends unsolicited DUA async callbacks (cmd=0x7f) for DSP
+ * framework events like "init phase complete" (0xf2). these arrive
+ * on the COMA socket and must be read by the application.
+ */
+
+struct dua_css_event {
+	uint32_t uid;
+	int32_t  elem;
+	int32_t  result;    /* event code (upper 24 bits of p[3]) */
+	uint8_t  type;      /* response type (lower 8 bits of p[3]) */
+};
+
+/* poll for one CSS event. returns 1 if event received, 0 if none, -1 error.
+ * non-blocking: returns immediately if no event pending. */
+int dua_poll_event(dua_session_t *sess, struct dua_css_event *evt);
+
+/*
  * low-level message building (for exploration / discovery commands)
  */
 

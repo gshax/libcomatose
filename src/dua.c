@@ -815,3 +815,31 @@ comatose_result_t dua_set_tdm_assignment(dua_session_t *sess,
 	return dua_unit_set(sess, uid, -2, DUA_PARAM_UMT_IMMEDIATE,
 	                    blob, blob_size);
 }
+
+/*
+ * CSS event polling
+ */
+
+int dua_poll_event(dua_session_t *sess, struct dua_css_event *evt)
+{
+	if (!sess || !evt)
+		return -1;
+
+	int cmd = dua_recv_one(sess, 0); /* non-blocking (0ms timeout) */
+	if (cmd < 0)
+		return 0; /* no event */
+
+	struct dua_msg *resp = (struct dua_msg *)sess->resp_buf;
+
+	/* only process async callbacks (cmd=0x7f) with deadbeef marker */
+	if (cmd != DUA_RESP_CMD_ASYNC || resp->num_params < 4 ||
+	    resp->params[0] != 0xdeadbeef)
+		return 0; /* not an async event we care about */
+
+	evt->uid    = resp->params[1];
+	evt->elem   = (int32_t)resp->params[2];
+	evt->result = dua_decode_async_result(resp->params[3]);
+	evt->type   = (uint8_t)(resp->params[3] & 0xff);
+
+	return 1;
+}

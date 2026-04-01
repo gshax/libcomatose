@@ -32,4 +32,9 @@ int bgsc_start(bgsc_ctx_t *ctx);
 /* stop threads and clean up. */
 void bgsc_stop(bgsc_ctx_t *ctx);
 
+/* send "level ready" messages for all 4 BG levels.
+ * called when the CSS signals init phase complete (event 0xf2)
+ * to advance the module readiness cascade toward RouteCODEC. */
+void bgsc_notify_ready(bgsc_ctx_t *ctx);
+
 #endif /* COMATOSE_BGSC_H */

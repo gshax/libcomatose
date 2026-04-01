@@ -322,6 +322,32 @@ static void module_startup(struct bgsc_ctx *ctx)
 			volatile uint32_t *dec = grp->elems[DFL_ELEM_DECODER];
 			elem_set_if_zero(dec, 0x28, DFL_FRAME_CONFIG_DEFAULT);
 		}
+
+		/* elem[12] (buffer manager): audio buffer differentiation.
+		 *
+		 * the CSS writes initial buffer pointers to elem[12]+0x8c
+		 * and +0x90 during DUA init. in stock, +0x090 gets shifted
+		 * by +0x140 during session start (same pattern as elem[22]).
+		 * without this shift, the CSS encoder reads from the WRONG
+		 * buffer (static init data at 0xbe14 instead of real TDM
+		 * audio at 0xbf54).
+		 *
+		 * we apply the shift here at init time. the CSS may also
+		 * shift it during session start, but having it pre-shifted
+		 * ensures audio routing works from the first session. */
+		if (grp->num_elems > 12 && grp->elems[12]) {
+			volatile uint32_t *e12 = grp->elems[12];
+			/* +0x90 from elem base = word index 0x90/4 = 36 */
+			volatile uint32_t *p90 = (volatile uint32_t *)
+				((char *)e12 + 0x90);
+			uint32_t val = *p90;
+			if (val > 0xb0000000) { /* looks like a shm pointer */
+				*p90 = val + 0x140;
+				fprintf(stderr, "bgsc: g%d e12+0x90: "
+				        "0x%x -> 0x%x (+0x140)\n",
+				        g, val, val + 0x140);
+			}
+		}
 	}
 
 	__sync_synchronize();
@@ -753,4 +779,13 @@ void bgsc_stop(bgsc_ctx_t *ctx)
 
 	fprintf(stderr, "bgsc: stopped\n");
 	free(ctx);
+}
+
+void bgsc_notify_ready(bgsc_ctx_t *ctx)
+{
+	if (!ctx)
+		return;
+	for (int i = 0; i < 4; i++)
+		ringbuf_send_level_ready(&ctx->rb, i);
+	fprintf(stderr, "bgsc: sent level-ready x4 (cascade response)\n");
 }

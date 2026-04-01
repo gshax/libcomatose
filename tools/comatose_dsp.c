@@ -208,8 +208,40 @@ int main(int argc, char *argv[])
 
 	ret = 0;
 
-	while (running)
-		sleep(1);
+	/* event loop: poll COMA socket for CSS→ARM events.
+	 *
+	 * the CSS sends DUA async callbacks for DSP framework events.
+	 * critical event 0xf2 = "init phase complete": the CSS needs us
+	 * to respond with level-ready AND I-switch setup (PREPARE_RUN
+	 * bits on control words) to advance the module readiness cascade.
+	 *
+	 * TODO: implement I-switch setup. currently we only send
+	 * level-ready once, which is not enough (CSS re-sends 0xf2). */
+	{
+		int f2_responded = 0;
+
+		while (running) {
+			if (sess) {
+				struct dua_css_event evt;
+				int r = dua_poll_event(sess, &evt);
+				if (r > 0) {
+					fprintf(stderr, "css_event: uid=0x%x elem=%d "
+					        "result=0x%x type=%d\n",
+					        evt.uid, evt.elem, evt.result,
+					        evt.type);
+
+					if (evt.result == 0xf2 && bgsc &&
+					    !f2_responded) {
+						fprintf(stderr, "  -> cascade: "
+						        "sending level-ready\n");
+						bgsc_notify_ready(bgsc);
+						f2_responded = 1;
+					}
+				}
+			}
+			usleep(10000);
+		}
+	}
 
 	/* --- teardown --- */
 	fprintf(stderr, "\n--- shutting down ---\n");
