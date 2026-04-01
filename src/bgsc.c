@@ -213,11 +213,21 @@ static void ftab_dispatch(struct bgsc_ctx *ctx)
 			 * transition and send completion event */
 			uint32_t new_val = (val & 6) ? 1 : 0;
 			*cw = new_val;
-			*(cw + 1) = 1;
 
-			/* pre-set buffer ready flag for encoder channels */
+			/* set elem+4 = 1 only if it's currently 0.
+			 * elem[6] and elem[21] need +4 = 1 (status flag).
+			 * elem[22] has a signal block POINTER at +4 that
+			 * we must not overwrite. checking for 0 protects
+			 * against corrupting pre-existing pointer values. */
+			if (*(cw + 1) == 0) {
+				*(cw + 1) = 1;
+			}
+
+			/* pre-set buffer ready flag for encoder channels.
+			 * real buffer pointers are shm addresses (0xb6xxxxxx),
+			 * not small values like 0x000200a2. */
 			uint32_t buf_addr = *(cw + 5);
-			if (buf_addr > 0x10000) {
+			if (buf_addr > 0xb0000000) {
 				*(cw + 4) = 0x00010001;
 			}
 			__sync_synchronize();
