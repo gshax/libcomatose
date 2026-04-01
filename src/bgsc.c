@@ -781,11 +781,75 @@ void bgsc_stop(bgsc_ctx_t *ctx)
 	free(ctx);
 }
 
+/*
+ * I-switch setup — set PREPARE_RUN bits on element control words.
+ *
+ * replicates the BG level state machine's state 4/3 behavior from
+ * stock dfl_calc. the CSS expects to see PREPARE_RUN bits (0x20 or
+ * 0x80) on control words BEFORE accepting level-ready as a valid
+ * "module initialization complete" signal.
+ *
+ * from CSS decompilation of dfl_calc state 4:
+ *   for each FTAB entry:
+ *     if (cw & 1 == 0): inactive → cw |= 0x200 | 0x80  (ALT_PREPARE)
+ *     else:              active  → cw |= 0x20           (PREPARE_RUN)
+ *     (mode bitmap selects which entries get the bits)
+ *
+ * we don't have the mode bitmap (MTAB), so we set PREPARE_RUN on all
+ * elements. entries that shouldn't be activated will have their bits
+ * cleared by the CSS dispatch on the next cycle.
+ */
+static void bgsc_iswitch_setup(bgsc_ctx_t *ctx)
+{
+	/* phase 1: set PREPARE_RUN bits */
+	int count = 0;
+	for (int g = 0; g < ctx->num_groups; g++) {
+		struct elem_group *grp = &ctx->groups[g];
+		for (int i = 0; i < grp->num_elems; i++) {
+			volatile uint32_t *cw = grp->elems[i];
+			if (!cw) continue;
+
+			uint32_t val = *cw;
+			if (val > 0x3ff && val != 0)
+				continue;
+
+			if ((val & 1) == 0)
+				*cw = val | 0x280;
+			else
+				*cw = val | 0x20;
+			count++;
+		}
+	}
+	__sync_synchronize();
+
+	/* phase 2: activation — convert PREPARE_RUN to ACTIVE/PENDING.
+	 * replicates dfl_activate_new_flow (FUN_0007e8dc):
+	 *   1. clear bits 0-2 of all control words
+	 *   2. right-shift by 5 (PREPARE_RUN bit 5 → ACTIVE bit 0)
+	 * this is what the state machine does between state 4 and 0x200. */
+	for (int g = 0; g < ctx->num_groups; g++) {
+		struct elem_group *grp = &ctx->groups[g];
+		for (int i = 0; i < grp->num_elems; i++) {
+			volatile uint32_t *cw = grp->elems[i];
+			if (!cw) continue;
+
+			uint32_t val = *cw;
+			if (val > 0x3ff && val != 0)
+				continue;
+
+			*cw = (val & ~(uint32_t)7) >> 5;
+		}
+	}
+	__sync_synchronize();
+	fprintf(stderr, "bgsc: I-switch: PREPARE_RUN on %d elems + activated\n",
+	        count);
+}
+
 void bgsc_notify_ready(bgsc_ctx_t *ctx)
 {
 	if (!ctx)
 		return;
+
 	for (int i = 0; i < 4; i++)
 		ringbuf_send_level_ready(&ctx->rb, i);
-	fprintf(stderr, "bgsc: sent level-ready x4 (cascade response)\n");
 }

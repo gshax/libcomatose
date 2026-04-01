@@ -218,24 +218,31 @@ int main(int argc, char *argv[])
 	 * TODO: implement I-switch setup. currently we only send
 	 * level-ready once, which is not enough (CSS re-sends 0xf2). */
 	{
-		int f2_responded = 0;
+		int evt_count = 0;
+		int f2_count = 0;
+		const int F2_MAX = 5; /* respond to at most 5 0xf2 events */
 
 		while (running) {
 			if (sess) {
 				struct dua_css_event evt;
 				int r = dua_poll_event(sess, &evt);
 				if (r > 0) {
-					fprintf(stderr, "css_event: uid=0x%x elem=%d "
+					evt_count++;
+					fprintf(stderr, "css_event[%d]: "
+					        "uid=0x%x elem=%d "
 					        "result=0x%x type=%d\n",
-					        evt.uid, evt.elem, evt.result,
+					        evt_count, evt.uid,
+					        evt.elem, evt.result,
 					        evt.type);
 
 					if (evt.result == 0xf2 && bgsc &&
-					    !f2_responded) {
-						fprintf(stderr, "  -> cascade: "
-						        "sending level-ready\n");
+					    f2_count < F2_MAX) {
+						f2_count++;
+						fprintf(stderr,
+						        "  -> level-ready "
+						        "(%d/%d)\n",
+						        f2_count, F2_MAX);
 						bgsc_notify_ready(bgsc);
-						f2_responded = 1;
 					}
 				}
 			}
