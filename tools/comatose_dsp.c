@@ -211,12 +211,13 @@ int main(int argc, char *argv[])
 	/* event loop: poll COMA socket for CSS→ARM events.
 	 *
 	 * the CSS sends DUA async callbacks for DSP framework events.
-	 * critical event 0xf2 = "init phase complete": the CSS needs us
-	 * to respond with level-ready AND I-switch setup (PREPARE_RUN
-	 * bits on control words) to advance the module readiness cascade.
+	 * critical event 0xf2 = "init phase complete": we respond with
+	 * level-ready messages to advance the module readiness cascade
+	 * toward RouteCODEC (which enables audio routing).
 	 *
-	 * TODO: implement I-switch setup. currently we only send
-	 * level-ready once, which is not enough (CSS re-sends 0xf2). */
+	 * the CSS handles its own I-switch setup internally via
+	 * p_dspa_msg_CallBack — the ARM must NOT set I-switch bits on
+	 * CSS-level elements. */
 	{
 		int evt_count = 0;
 		int f2_count = 0;

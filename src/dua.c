@@ -686,7 +686,21 @@ comatose_result_t dua_full_init(dua_session_t *sess,
 
 	comatose_result_t ret;
 
-	/* allocate FXS units: mode 1 (DSP pipeline) + connect(-3) */
+	/* allocate FXS units: mode 1 (DSP pipeline) + VFD activation + connect(-3)
+	 *
+	 * stock lib_dua_init does 6 operations per FXS unit. the critical ones:
+	 *   1. UnitAllocate(FXS, i)
+	 *   2. UnitSet(uid, -2, UMT_EXEC_GEN, mode=1) — creates DSP FIFOs
+	 *   3. UnitSet(uid, 0x13, USM_DO, dtmf_config) — DTMF detection setup
+	 *   4. UnitSet(uid, 0x3b, USM_DO, 1) — VFD state activation!
+	 *   5. UnitConnect(uid, -3)
+	 *   6. UnitSet(uid, -1, CBK_FUNC, callback) — async event callback
+	 *
+	 * step 4 is CRITICAL for audio: it triggers switchVfdState() on the CSS
+	 * which calls p_da_SwitchInstance() → dfl_set_I_switch() to activate the
+	 * signal routing elements in the CSS level 0 dispatch. without this,
+	 * FXS audio routing elements stay INACTIVE and no audio flows from TDM
+	 * to the encoder pipeline. */
 	for (int i = 0; i < num_fxs; i++) {
 		ret = dua_unit_allocate(sess, DUA_UT_FXS, i, &state->fxs_uids[i]);
 		if (ret != COMATOSE_OK) {
@@ -698,6 +712,17 @@ comatose_result_t dua_full_init(dua_session_t *sess,
 		if (ret != COMATOSE_OK) {
 			fprintf(stderr, "dua_full_init: fxs_mode[%d] failed\n", i);
 			goto fail;
+		}
+		/* activate VFD state — triggers CSS switchVfdState() which enables
+		 * signal routing I-switches for this FXS port's audio path */
+		{
+			uint32_t vfd_on = 1;
+			ret = dua_unit_set(sess, state->fxs_uids[i], 0x3b,
+			                   DUA_PARAM_USM_DO, &vfd_on, sizeof(vfd_on));
+			if (ret != COMATOSE_OK) {
+				fprintf(stderr, "dua_full_init: fxs_vfd[%d] failed\n", i);
+				goto fail;
+			}
 		}
 		ret = dua_unit_connect(sess, state->fxs_uids[i], -3);
 		if (ret != COMATOSE_OK) {
