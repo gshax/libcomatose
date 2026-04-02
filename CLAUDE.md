@@ -35,6 +35,7 @@ header-only definition files (`*_defs.h`) can be used independently.
 
 ## tools
 
+- `comatosed` — main daemon. by default runs alongside stock `app_dsp`; use `--full-stack` for experimental full subsystem takeover
 - `dua_intercom` — full intercom setup: allocate all units, connect two FXS ports
 - `dua_enumerate` — enumerate DUA unit types and elements
 - `dua_probe` — step-by-step DUA init with diagnostics

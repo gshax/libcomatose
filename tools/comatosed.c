@@ -1,16 +1,23 @@
 /*
- * comatose_dsp - all-in-one hardware support daemon
+ * comatosed - hardware support daemon for Grandstream HT8xx ATAs
  *
- * initializes the full audio subsystem (BSP, DUA, FXS/VOIP units, TDM)
- * and keeps it alive for client applications that use /dev/voiceN.
+ * by default, runs alongside the stock app_dsp process: discovers
+ * hardware and allocates DUA units without re-initializing the audio
+ * subsystem. this is the safe, production-ready mode.
+ *
+ * use --full-stack to take over the entire audio subsystem from a
+ * clean boot (BSP reset, DUA init, BGSC codec threads). this is
+ * experimental and may not work across firmware versions.
  *
  * runs in the foreground; use an init system for daemonization.
  *
- * usage: comatose_dsp [options]
- *   --no-bsp-reset    skip BSP reset assert/deassert
- *   --no-dua-init     skip DUA shared memory + init_hw/appl_init
+ * usage: comatosed [options]
+ *   --full-stack      full subsystem takeover (BSP reset + DUA init + BGSC)
+ *   --no-bsp-reset    skip BSP reset (default without --full-stack)
+ *   --no-dua-init     skip DUA init  (default without --full-stack)
+ *   --no-bgsc         skip BGSC      (default without --full-stack)
  *   --no-tdm-grant    skip TDM grant (procfs write)
- *   --no-bgsc         don't start BGSC codec threads
+ *   --bgsc-only       mmap shm for BGSC without DUA init (after app_dsp)
  *   --fxs-count N     override discovered FXS port count
  */
 
@@ -55,7 +62,35 @@ int main(int argc, char *argv[])
 	int no_bgsc = 0;
 	int bgsc_only = 0;
 	int fxs_override = -1;
+	int full_stack = 0;
 
+	/* first pass: check for --full-stack and validate all args */
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--full-stack") == 0)
+			full_stack = 1;
+		else if (strcmp(argv[i], "--fxs-count") == 0 && i + 1 < argc)
+			i++; /* skip value */
+		else if (strcmp(argv[i], "--no-bsp-reset") == 0 ||
+		         strcmp(argv[i], "--no-dua-init") == 0 ||
+		         strcmp(argv[i], "--no-tdm-grant") == 0 ||
+		         strcmp(argv[i], "--no-bgsc") == 0 ||
+		         strcmp(argv[i], "--bgsc-only") == 0)
+			; /* handled in second pass */
+		else {
+			fprintf(stderr, "unknown option: %s\n", argv[i]);
+			return 1;
+		}
+	}
+
+	/* default: alongside app_dsp (skip BSP reset, DUA init, BGSC).
+	 * --full-stack flips to full subsystem takeover. */
+	if (!full_stack) {
+		no_bsp_reset = 1;
+		no_dua_init = 1;
+		no_bgsc = 1;
+	}
+
+	/* second pass: explicit --no-* flags override in either mode */
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--no-bsp-reset") == 0)
 			no_bsp_reset = 1;
@@ -69,16 +104,13 @@ int main(int argc, char *argv[])
 			bgsc_only = 1;
 		else if (strcmp(argv[i], "--fxs-count") == 0 && i + 1 < argc)
 			fxs_override = atoi(argv[++i]);
-		else {
-			fprintf(stderr, "unknown option: %s\n", argv[i]);
-			return 1;
-		}
 	}
 
 	signal(SIGINT, sighandler);
 	signal(SIGTERM, sighandler);
 
-	fprintf(stderr, "=== comatose_dsp ===\n");
+	fprintf(stderr, "=== comatosed %s===\n",
+	        full_stack ? "(full-stack) " : "");
 
 	tapi_port_t *ports[COMATOSE_MAX_FXS_PORTS] = {0};
 	dua_session_t *sess = NULL;
@@ -203,7 +235,7 @@ int main(int argc, char *argv[])
 	}
 
 	/* --- ready --- */
-	fprintf(stderr, "\n=== comatose_dsp ready (%d FXS ports) ===\n", num_fxs);
+	fprintf(stderr, "\n=== comatosed ready (%d FXS ports) ===\n", num_fxs);
 	fprintf(stderr, "Ctrl+C to shut down\n\n");
 
 	ret = 0;

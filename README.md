@@ -35,6 +35,7 @@ cd kmod && make         # build replacement TDM kernel module
 
 ## tools
 
+- `comatosed` — main hardware support daemon (runs alongside stock `app_dsp` by default; `--full-stack` for full subsystem takeover)
 - `css_shell` — CSS coprocessor debug console (interactive or `-c "command"`)
 - `dua_intercom` — full intercom setup between two FXS ports
 - `dua_enumerate` — discover available DUA units and elements
