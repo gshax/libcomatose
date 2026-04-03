@@ -89,9 +89,21 @@ the shell only works after DUA init (the I/O switch from UART to COMA
 happens during InitReq/ApplInit). send characters one at a time as
 2-byte messages: `{0x00, char}`.
 
+### TAPI ioctl encoding
+GS uses two encoding styles: simple `0x71xx` for plain int args, and full
+`_IOW` encoding (`0x4001xxxx`/`0x4004xxxx`) for struct pointer args.
+all ioctl numbers validated against `Get_IOCTL_Str()` in drv_tapi.ko.
+see `tapi_defs.h` for the complete verified table.
+
 ### line feed enum values
-`IFX_TAPI_LINE_FEED_ACTIVE = 0` (not 1!), `STANDBY = 2`. the grandstream
-fork swapped these compared to what you might expect.
+`IFX_TAPI_LINE_FEED_ACTIVE = 0`, `STANDBY = 2`. both map to the same
+ProSLIC register value (FWD_ACTIVE). standby is electrically a no-op.
+use `DISABLED = 4` to actually cut power (ProSLIC OPEN).
+
+### ringing
+always set `RING_CADENCE_HR_SET` before `RING_START`. do NOT set line feed
+around ringing — the driver manages it internally. touching line state
+confuses the internal ring state machine and octuple_ring_sema.
 
 ### BSP major number
 dynamically allocated on alpine (246), not hardcoded (122). the library
