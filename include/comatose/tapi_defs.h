@@ -53,50 +53,106 @@ typedef struct {
 /*
  * FXS ioctls (/dev/fxsXX)
  *
- * these numbers are grandstream's mutated VINETIC values and do NOT match
- * any publicly available version of the Infineon/Lantiq TAPI SDK.
+ * validated against Get_IOCTL_Str() in GS drv_tapi.ko (0x00014d20).
+ *
+ * GS uses two ioctl encoding styles:
+ *   - "simple": (type << 8) | nr, where type = 0x71 ('q')
+ *   - "_IOW":   full Linux _IOW(type, nr, size) encoding with direction
+ *               and size bits (0x4001xxxx or 0x4004xxxx)
+ *
+ * ioctls that take a plain int arg use simple encoding.
+ * ioctls that take a struct pointer use _IOW encoding.
  */
 
 /* channel initialization */
 #define IFX_TAPI_CH_INIT                  0x710f
 
-/* line feed control */
-#define IFX_TAPI_LINE_FEED_SET            0x7101
-#define IFX_TAPI_LINE_HOOK_STATUS_GET     0x7184
-#define IFX_TAPI_LINE_HOOK_VT_SET         0x712e
-#define IFX_TAPI_LINE_DC_FEED_SET         0x7149
-#define IFX_TAPI_LINE_IMPEDANCE_SET       0x7109
-#define IFX_TAPI_LINE_TYPE_SET            0x7107
+/* line feed / line control */
+#define IFX_TAPI_LINE_FEED_SET            0x7101      /* arg: enum tapi_line_feed */
+#define IFX_TAPI_LINE_HOOK_STATUS_GET     0x7184      /* arg: int* (0=on-hook, 1=off-hook) */
+#define IFX_TAPI_LINE_TYPE_SET            0x40047147  /* arg: IFX_TAPI_LINE_TYPE_CFG_t* */
+#define IFX_TAPI_LINE_HOOK_VT_SET         0x4004712e  /* arg: struct* (hook thresholds) */
+#define IFX_TAPI_LINE_IMPEDANCE_SET       0x40047109  /* arg: struct* */
+#define IFX_TAPI_LINE_LEVEL_SET           0x40047146  /* arg: struct* */
+#define IFX_TAPI_LINE_POLARITY_GET        0x7189      /* arg: int* */
 
 /* ring control */
-#define IFX_TAPI_RING_CFG_SET             0x7102
-#define IFX_TAPI_RING_CADENCE_HR_SET      0x7103
-#define IFX_TAPI_RING_START               0x7187
-#define IFX_TAPI_RING_STOP                0x7188
-#define IFX_TAPI_RING_MAX_SET             0x7185
+#define IFX_TAPI_RING_CFG_SET             0x7102      /* arg: ring config */
+#define IFX_TAPI_RING_CADENCE_HR_SET      0x7103      /* arg: tapi_ring_cadence_t* */
+#define IFX_TAPI_RING                     0x7183      /* blocking ring */
+#define IFX_TAPI_RING_START               0x7187      /* arg: 0 (non-blocking) */
+#define IFX_TAPI_RING_STOP                0x7188      /* arg: 0 */
+#define IFX_TAPI_RING_MAX_SET             0x40017185  /* arg: uint32_t (max ring count) */
+#define IFX_TAPI_RING_CADENCE_SET         0x40027186  /* arg: uint32_t (simple cadence) */
 
 /* PCM / audio */
-#define IFX_TAPI_PCM_CFG_SET              0x7104
-#define IFX_TAPI_PCM_ACTIVATION_SET       0x7106
-#define IFX_TAPI_PCM_VOLUME_SET           0x7145
+#define IFX_TAPI_PCM_IF_CFG_SET           0x7111      /* PCM interface config */
+#define IFX_TAPI_PCM_CFG_SET              0x7104      /* per-channel PCM config */
+#define IFX_TAPI_PCM_CFG_GET              0x7105      /* read PCM config */
+#define IFX_TAPI_PCM_ACTIVATION_SET       0x7106      /* enable/disable PCM */
+#define IFX_TAPI_PCM_ACTIVATION_GET       0x7107      /* read PCM activation state */
+#define IFX_TAPI_PCM_VOLUME_SET           0x40047145  /* arg: volume struct* */
+#define IFX_TAPI_PHONE_VOLUME_SET         0x40047142  /* arg: volume struct* */
 
 /* tones */
-#define IFX_TAPI_TONE_LOCAL_PLAY          0x719b
-#define IFX_TAPI_TONE_NET_PLAY            0x71c5
-#define IFX_TAPI_TONE_STOP                0x71a4
+#define IFX_TAPI_TONE_LOCAL_PLAY          0x4001719b  /* arg: int32_t (tone index) */
+#define IFX_TAPI_TONE_NET_PLAY            0x400171c5  /* arg: int32_t (tone index) */
+#define IFX_TAPI_TONE_STOP                0x71a4      /* arg: int32_t */
+#define IFX_TAPI_TONE_LOCAL_STOP          0x400171ab  /* arg: int32_t */
+#define IFX_TAPI_TONE_NET_STOP            0x400171ac  /* arg: int32_t */
+#define IFX_TAPI_TONE_BUSY_PLAY           0x71a1
+#define IFX_TAPI_TONE_RINGBACK_PLAY       0x71a2
+#define IFX_TAPI_TONE_DIALTONE_PLAY       0x71a3
+#define IFX_TAPI_TONE_LEVEL_SET           0x7108
+#define IFX_TAPI_TONE_TABLE_CFG_SET       0x40047136  /* arg: tone table struct* */
 
 /* caller ID */
-#define IFX_TAPI_CID_CFG_SET              0x71b0
-#define IFX_TAPI_CID_TX_SEQ_START         0x71b2
-#define IFX_TAPI_CID_TX_INFO_STOP         0x71b5
+#define IFX_TAPI_CID_CFG_SET              0x400471b0  /* arg: CID config struct* */
+#define IFX_TAPI_CID_TX_SEQ_START         0x400471b2  /* arg: CID msg struct* */
+#define IFX_TAPI_CID_TX_INFO_START        0x400471b1  /* arg: CID msg struct* */
+#define IFX_TAPI_CID_TX_INFO_STOP         0x400471b5
 
 /* events */
-#define IFX_TAPI_EVENT_GET                0x71c0
-#define IFX_TAPI_EVENT_ENABLE             0x71c1
-#define IFX_TAPI_EVENT_DISABLE            0x71c2
+#define IFX_TAPI_EVENT_GET                0x71c0      /* arg: tapi_event_t* */
+#define IFX_TAPI_EVENT_ENABLE             0x71c1      /* arg: tapi_event_t* */
+#define IFX_TAPI_EVENT_DISABLE            0x71c2      /* arg: tapi_event_t* */
 
-/* ring cadence */
-#define IFX_TAPI_RING_CADENCE_HR_SET      0x7103
+/* mapping (data/phone/PCM channel routing) */
+#define IFX_TAPI_MAP_DATA_ADD             0x40047124
+#define IFX_TAPI_MAP_DATA_REMOVE          0x40047125
+#define IFX_TAPI_MAP_PHONE_ADD            0x4004712a
+#define IFX_TAPI_MAP_PHONE_REMOVE         0x4004712b
+#define IFX_TAPI_MAP_PCM_ADD              0x40047143
+#define IFX_TAPI_MAP_PCM_REMOVE           0x40047144
+
+/* diagnostics */
+#define IFX_TAPI_VERSION_GET              0x7100
+#define IFX_TAPI_LASTERR                  0x40047148
+#define IFX_TAPI_DEBUG_REPORT_SET         0x7112
+#define IFX_TAPI_TEST_HOOKGEN             0x4004713e
+#define IFX_TAPI_TEST_LOOP                0x4004713f
+
+/* metering */
+#define IFX_TAPI_METER_CFG_SET            0x710c
+#define IFX_TAPI_METER_START              0x710d
+#define IFX_TAPI_METER_STOP               0x710e
+
+/* FXO (documented for completeness — HT818 has no FXO) */
+#define IFX_TAPI_FXO_DIAL_CFG_SET         0x400471d6
+#define IFX_TAPI_FXO_FLASH_CFG_SET        0x400471d7
+#define IFX_TAPI_FXO_OSI_CFG_SET          0x400471d8
+#define IFX_TAPI_FXO_DIAL_START           0x400471d9
+#define IFX_TAPI_FXO_DIAL_STOP            0x400471da
+#define IFX_TAPI_FXO_HOOK_SET             0x400471db
+#define IFX_TAPI_FXO_FLASH_SET            0x400471dc
+#define IFX_TAPI_FXO_BAT_GET              0x400471dd
+#define IFX_TAPI_FXO_HOOK_GET             0x400471de
+#define IFX_TAPI_FXO_APOH_GET             0x400471df
+#define IFX_TAPI_FXO_RING_GET             0x400471e0
+#define IFX_TAPI_FXO_POLARITY_GET         0x400471e1
+
+/* legacy / misc */
+#define IFX_TAPI_EXCEPTION_MASK           0x7110
 
 /*
  * ring cadence structure (for IFX_TAPI_RING_CADENCE_HR_SET)

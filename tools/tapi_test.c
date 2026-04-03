@@ -411,12 +411,15 @@ int main(int argc, char *argv[])
 	/* --- cleanup --- */
 	for (int i = first_port; i <= last_port; i++) {
 		if (!ports[i]) continue;
-		/* only touch line state if we explicitly changed it */
-		if (linefeed_val >= 0)
-			tapi_line_feed_set(ports[i],
-			                   IFX_TAPI_LINE_FEED_DISABLED);
+		/* stop ringing if we started it */
 		if (ring_on == 1)
 			tapi_ring_stop(ports[i]);
+		/* stop tone if we started one */
+		if (tone_code >= 0)
+			tapi_tone_stop(ports[i]);
+		/* don't touch line state — we're a diagnostic tool running
+		 * alongside app_dsp, and disabling lines on exit would
+		 * pull battery from under the stock stack's feet. */
 		tapi_port_close(ports[i]);
 		ports[i] = NULL;
 	}
