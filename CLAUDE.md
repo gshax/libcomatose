@@ -1,27 +1,15 @@
 # libcomatose
 
-open source C library wrapping the COMA/DUA/TAPI interfaces of the Grandstream HT818 VoIP ATA.
+open source C library wrapping the COMA/DUA/TAPI interfaces of Grandstream ATAs.
 
 ## building
 
 native: `make`
-cross-compile for ht818: `make CC=arm-none-linux-gnueabi-gcc AR=arm-none-linux-gnueabi-ar`
+cross-compile for ARMv7 by setting `CC` and `AR` (verify correct toolchain with user if unclear)
 tools: `make tools` (after building the library)
 kernel module: `cd kmod && make` (needs kernel source tree at materials/linux-4.9.0)
 
 tools are statically linked for easy deployment to the device.
-
-## deploying to the ht818
-
-the device is netbooted into alpine linux (`root@10.70.3.112`, password `alpine`).
-
-deploy via scp:
-```
-scp tools/<binary> root@10.70.3.112:/tmp/
-scp kmod/comatose_tdm.ko root@10.70.3.112:/tmp/
-```
-
-use `coma_tapi_full_reset` on the device to reload SLIC modules + CSS firmware.
 
 ## architecture
 
@@ -29,21 +17,9 @@ three independent layers:
 - `coma.c` — AF_COMA socket transport (PF_COMA=43, SOCK_SEQPACKET)
 - `dua.c` — DUA protocol: shared memory init, message building, request/reply correlation, TDM assignment UMT bytecode
 - `tapi.c` — TAPI ioctls for SLIC hardware control (/dev/fxsXX, /dev/slic_bsp)
-- `kmod/comatose_tdm.c` — replacement TDM kernel module (deregisters stock BUG_ON handler)
+- `kmod/comatose_tdm.c` — replacement TDM kernel module (only necessary for debugging TDM grant issues, deregisters stock BUG_ON handler)
 
 header-only definition files (`*_defs.h`) can be used independently.
-
-## tools
-
-- `comatosed` — main daemon. by default runs alongside stock `app_dsp`; use `--full-stack` for experimental full subsystem takeover
-- `dua_intercom` — full intercom setup: allocate all units, connect two FXS ports
-- `dua_enumerate` — enumerate DUA unit types and elements
-- `dua_probe` — step-by-step DUA init with diagnostics
-- `tdm_diag` — minimal DUA setup + TDM assignment (exits cleanly, doesn't hang CSS)
-- `tdm_brute` — TDM channel count brute forcer
-- `css_shell` — CSS debug console client (`-c "command"` or interactive)
-- `coma_test` — low-level COMA socket connectivity test
-- `bsp_init` — BSP and SLIC initialization
 
 ## critical implementation notes
 
@@ -51,12 +27,9 @@ header-only definition files (`*_defs.h`) can be used independently.
 the COMA kernel socket returns EOPNOTSUPP on plain `recv()` but works correctly
 with `recvmsg()`. always use `coma_recv()` which wraps `recvmsg()` internally.
 
-### DUA sync vs async responses (IMPORTANT)
+### DUA sync vs async responses
 the DUA sync response (cmd=0x81) only means "message received by CSS." the actual
-operation result arrives later as an async callback (cmd=0x7f). our current code
-returns "OK" from the sync response and ignores the async callbacks, which masks
-real errors. the stock `libcordless.so` has `p_duasync_*` wrappers that use a
-mutex + `duasync_coma_wait()` to block until the async result arrives.
+operation result arrives later as an async callback (cmd=0x7f).
 
 ### DUA initialization sequence
 the CSS firmware requires a specific init order before DUA commands work:
@@ -108,17 +81,3 @@ confuses the internal ring state machine and octuple_ring_sema.
 ### BSP major number
 dynamically allocated on alpine (246), not hardcoded (122). the library
 reads it from `/proc/devices` at runtime.
-
-### TDM grant (CURRENT BLOCKER)
-the CSS TDM instance has channel count = 0 and rejects all grants with -7.
-the stock kernel module has BUG_ON in the nack handler — use our replacement
-`comatose_tdm.ko` instead. the TDM channel count initialization path in the
-kernel needs further investigation. see `research/claudes_notes/tdm_grant_investigation.md`.
-
-## key source references
-
-- CSS firmware analysis: `../research/claudes_notes/`
-- kernel COMA source: `../materials/linux-4.9.0/drivers/staging/dspg/coma/`
-- kernel TDM driver: `../materials/linux-4.9.0/drivers/staging/grandstream/tdm/gs-tdm.c`
-- stock libcordless: `../materials/mtdblock/ht818base/app/lib/libcordless.so`
-- stock app_dsp: `../materials/mtdblock/ht818base/usr/bin/app_dsp`

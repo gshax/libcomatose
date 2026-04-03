@@ -11,7 +11,7 @@ TOOLS = $(TOOL_SRCS:.c=)
 
 .PHONY: all clean tools
 
-all: libcomatose.a
+all: tools
 
 libcomatose.a: $(OBJS)
 	$(AR) rcs $@ $^

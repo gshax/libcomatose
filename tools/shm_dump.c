@@ -1,7 +1,7 @@
 /*
- * shmdump - dump CSS shared memory regions
+ * shm_dump - dump CSS shared memory regions
  *
- * usage: shmdump [offset] [length]
+ * usage: shm_dump [offset] [length]
  *   offset: byte offset into shared memory (hex or decimal, default 0)
  *   length: bytes to dump (default 256)
  *   --bin:  output raw binary to stdout instead of hex dump to stdout
