@@ -163,13 +163,19 @@ int tapi_init_all(tapi_port_t **ports, int max_ports,
 	if (num_fxs > COMATOSE_MAX_FXS_PORTS)
 		num_fxs = COMATOSE_MAX_FXS_PORTS;
 
-	/* open all FXS ports */
+	/* open and initialize all FXS ports */
 	for (int i = 0; i < num_fxs; i++) {
 		comatose_result_t r = tapi_port_open(&ports[i], i);
 		if (r != COMATOSE_OK) {
 			fprintf(stderr, "tapi_init_all: port %d open failed\n", i);
-			/* close already-opened ports */
 			for (int j = i - 1; j >= 0; j--)
+				tapi_port_close(ports[j]);
+			return -1;
+		}
+		r = tapi_port_init(ports[i]);
+		if (r != COMATOSE_OK) {
+			fprintf(stderr, "tapi_init_all: port %d init failed\n", i);
+			for (int j = i; j >= 0; j--)
 				tapi_port_close(ports[j]);
 			return -1;
 		}
@@ -184,7 +190,7 @@ void tapi_close_all(tapi_port_t **ports, int num_ports)
 		return;
 	for (int i = 0; i < num_ports; i++) {
 		if (ports[i]) {
-			tapi_line_feed_set(ports[i], IFX_TAPI_LINE_FEED_STANDBY);
+			tapi_line_feed_set(ports[i], IFX_TAPI_LINE_FEED_DISABLED);
 			tapi_port_close(ports[i]);
 			ports[i] = NULL;
 		}
@@ -219,20 +225,6 @@ comatose_result_t tapi_port_open(tapi_port_t **out, int port_index)
 	if (fd < 0)
 		return COMATOSE_ERR_IOCTL;
 
-	if (ioctl(fd, IFX_TAPI_CH_INIT, 0) < 0) {
-		close(fd);
-		return COMATOSE_ERR_IOCTL;
-	}
-
-	IFX_TAPI_LINE_TYPE_CFG_t linecfg = {
-		.lineType = IFX_TAPI_LINE_TYPE_FXS,
-		.nDaaCh = 0,
-	};
-	if (ioctl(fd, IFX_TAPI_LINE_TYPE_SET, &linecfg) < 0) {
-		close(fd);
-		return COMATOSE_ERR_IOCTL;
-	}
-
 	tapi_port_t *port = calloc(1, sizeof(*port));
 	if (!port) {
 		close(fd);
@@ -242,6 +234,24 @@ comatose_result_t tapi_port_open(tapi_port_t **out, int port_index)
 	port->index = port_index;
 
 	*out = port;
+	return COMATOSE_OK;
+}
+
+comatose_result_t tapi_port_init(tapi_port_t *port)
+{
+	if (!port)
+		return COMATOSE_ERR_INVALID;
+
+	if (ioctl(port->fd, IFX_TAPI_CH_INIT, 0) < 0)
+		return COMATOSE_ERR_IOCTL;
+
+	IFX_TAPI_LINE_TYPE_CFG_t linecfg = {
+		.lineType = IFX_TAPI_LINE_TYPE_FXS,
+		.nDaaCh = 0,
+	};
+	if (ioctl(port->fd, IFX_TAPI_LINE_TYPE_SET, &linecfg) < 0)
+		return COMATOSE_ERR_IOCTL;
+
 	return COMATOSE_OK;
 }
 
@@ -287,6 +297,34 @@ comatose_result_t tapi_hook_status_get(tapi_port_t *port, int *status)
  * ring control
  */
 
+comatose_result_t tapi_ring_cadence_set(tapi_port_t *port,
+                                        const tapi_ring_cadence_t *cadence)
+{
+	if (!port)
+		return COMATOSE_ERR_INVALID;
+
+	tapi_ring_cadence_t cad;
+	if (cadence) {
+		cad = *cadence;
+	} else {
+		/* standard NA cadence: 2s on / 4s off
+		 * 2s = 40 bits of 1, 4s = 80 bits of 0, total = 120 bits
+		 * data[0..4] = 0xff (40 bits), rest = 0 */
+		memset(&cad, 0, sizeof(cad));
+		cad.data[0] = 0xff;
+		cad.data[1] = 0xff;
+		cad.data[2] = 0xff;
+		cad.data[3] = 0xff;
+		cad.data[4] = 0xff;
+		cad.nr = 120;
+		cad.initialNr = 0;
+	}
+
+	if (ioctl(port->fd, IFX_TAPI_RING_CADENCE_HR_SET, &cad) < 0)
+		return COMATOSE_ERR_IOCTL;
+	return COMATOSE_OK;
+}
+
 comatose_result_t tapi_ring_start(tapi_port_t *port)
 {
 	if (!port)
@@ -331,15 +369,18 @@ comatose_result_t tapi_tone_stop(tapi_port_t *port)
  * events
  */
 
-comatose_result_t tapi_event_get(tapi_port_t *port, void *buf, size_t buflen)
+comatose_result_t tapi_event_get(tapi_port_t *port, tapi_event_t *evt)
 {
-	if (!port || !buf || buflen < 4)
+	if (!port || !evt)
 		return COMATOSE_ERR_INVALID;
-	memset(buf, 0, buflen);
-	if (ioctl(port->fd, IFX_TAPI_EVENT_GET, buf) < 0) {
+	memset(evt, 0, sizeof(*evt));
+	if (ioctl(port->fd, IFX_TAPI_EVENT_GET, evt) < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			return COMATOSE_ERR_TIMEOUT;
 		return COMATOSE_ERR_IOCTL;
 	}
+	/* id == 0 means no event was pending */
+	if (evt->id == 0)
+		return COMATOSE_ERR_TIMEOUT;
 	return COMATOSE_OK;
 }

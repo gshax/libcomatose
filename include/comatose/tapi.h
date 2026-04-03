@@ -49,9 +49,14 @@ void tapi_close_all(tapi_port_t **ports, int num_ports);
  * per-port FXS control
  */
 
-/* open and initialize an FXS port. creates /dev/fxsN device node if needed,
- * runs CH_INIT and LINE_TYPE_SET. port_index is 0-based. */
+/* open an FXS port. creates /dev/fxsN device node if needed.
+ * does NOT send any ioctls — safe alongside app_dsp or comatosed. */
 comatose_result_t tapi_port_open(tapi_port_t **out, int port_index);
+
+/* initialize an already-open FXS port (CH_INIT + LINE_TYPE_SET).
+ * only needed when taking ownership of the TAPI stack from scratch.
+ * tapi_init_all() calls this automatically. */
+comatose_result_t tapi_port_init(tapi_port_t *port);
 
 /* close an FXS port. */
 void tapi_port_close(tapi_port_t *port);
@@ -73,6 +78,11 @@ comatose_result_t tapi_hook_status_get(tapi_port_t *port, int *status);
  * ring control
  */
 
+/* set ring cadence pattern. must be called before ring_start.
+ * if cadence is NULL, sets standard NA cadence (2s on / 4s off). */
+comatose_result_t tapi_ring_cadence_set(tapi_port_t *port,
+                                        const tapi_ring_cadence_t *cadence);
+
 /* start ringing on a port. */
 comatose_result_t tapi_ring_start(tapi_port_t *port);
 
@@ -92,14 +102,14 @@ comatose_result_t tapi_tone_stop(tapi_port_t *port);
 /*
  * event handling
  *
- * note: the event structure is currently opaque until we nail down the
- * exact grandstream-mutated IFX_TAPI_EVENT_t layout. use tapi_port_fd()
- * with poll() to detect when events are pending, then read them with
- * tapi_event_get(). the raw event buffer can be inspected for now.
+ * the event structure is 16 bytes (4 x uint32), matching the GS fork of
+ * drv_tapi.ko's internal FIFO element size. use tapi_port_fd() with
+ * poll() to detect when events are pending, then drain with tapi_event_get().
  */
 
 /* get next pending event. returns COMATOSE_OK if an event was available,
- * COMATOSE_ERR_TIMEOUT if none pending. buf must be at least 64 bytes. */
-comatose_result_t tapi_event_get(tapi_port_t *port, void *buf, size_t buflen);
+ * COMATOSE_ERR_TIMEOUT if none pending. check evt->more to see if the
+ * FIFO has more events to drain. */
+comatose_result_t tapi_event_get(tapi_port_t *port, tapi_event_t *evt);
 
 #endif /* COMATOSE_TAPI_H */

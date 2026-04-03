@@ -291,10 +291,10 @@ cleanup:
 	if (bgsc)
 		bgsc_stop(bgsc);
 
-	/* standby all lines */
+	/* disable all lines (STANDBY is a no-op — same as ACTIVE electrically) */
 	for (int i = 0; i < num_fxs; i++) {
 		if (ports[i])
-			tapi_line_feed_set(ports[i], IFX_TAPI_LINE_FEED_STANDBY);
+			tapi_line_feed_set(ports[i], IFX_TAPI_LINE_FEED_DISABLED);
 	}
 
 	/* DUA teardown */
